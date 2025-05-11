@@ -10,7 +10,7 @@ use solar_interface::{
 
 mod cursor;
 use cursor::token::{RawLiteralKind, RawToken, RawTokenKind};
-pub use cursor::{is_id_continue, is_id_start, is_ident, is_whitespace, token, Cursor};
+pub use cursor::*;
 
 pub mod unescape;
 
@@ -104,6 +104,7 @@ impl<'sess, 'src> Lexer<'sess, 'src> {
         trace!(
             src.len = self.src.len(),
             tokens.len = tokens.len(),
+            tokens.capacity = tokens.capacity(),
             ratio = %format_args!("{:.2}", self.src.len() as f64 / tokens.len() as f64),
             "lexed"
         );
