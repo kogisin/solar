@@ -1,11 +1,11 @@
 //! Solidity and Yul lexer.
 
 use solar_ast::{
+    Base, StrKind,
     token::{BinOpToken, CommentKind, Delimiter, Token, TokenKind, TokenLitKind},
-    Base,
 };
 use solar_interface::{
-    diagnostics::DiagCtxt, source_map::SourceFile, BytePos, Session, Span, Symbol,
+    BytePos, Session, Span, Symbol, diagnostics::DiagCtxt, source_map::SourceFile,
 };
 
 mod cursor;
@@ -240,7 +240,9 @@ impl<'sess, 'src> Lexer<'sess, 'src> {
                                 ascii_str,
                                 ascii_name,
                             } => {
-                                let msg = format!("Unicode characters '“' (Left Double Quotation Mark) and '”' (Right Double Quotation Mark) look like '{ascii_str}' ({ascii_name}), but are not");
+                                let msg = format!(
+                                    "Unicode characters '“' (Left Double Quotation Mark) and '”' (Right Double Quotation Mark) look like '{ascii_str}' ({ascii_name}), but are not"
+                                );
                                 err = err.span_help(span, msg);
                             }
                             unicode_chars::TokenSubstitution::Other {
@@ -251,7 +253,9 @@ impl<'sess, 'src> Lexer<'sess, 'src> {
                                 ascii_str,
                                 ascii_name,
                             } => {
-                                let msg = format!("Unicode character '{ch}' ({u_name}) looks like '{ascii_str}' ({ascii_name}), but it is not");
+                                let msg = format!(
+                                    "Unicode character '{ch}' ({u_name}) looks like '{ascii_str}' ({ascii_name}), but it is not"
+                                );
                                 err = err.span_help(span, msg);
                             }
                         }
@@ -301,23 +305,13 @@ impl<'sess, 'src> Lexer<'sess, 'src> {
         kind: RawLiteralKind,
     ) -> (TokenLitKind, Symbol) {
         match kind {
-            RawLiteralKind::Str { terminated, unicode } => {
+            RawLiteralKind::Str { kind, terminated } => {
                 if !terminated {
                     let span = self.new_span(start, end);
                     let guar = self.dcx().err("unterminated string").span(span).emit();
                     (TokenLitKind::Err(guar), self.symbol_from_to(start, end))
                 } else {
-                    let kind = if unicode { TokenLitKind::UnicodeStr } else { TokenLitKind::Str };
-                    self.cook_quoted(kind, start, end)
-                }
-            }
-            RawLiteralKind::HexStr { terminated } => {
-                if !terminated {
-                    let span = self.new_span(start, end);
-                    let guar = self.dcx().err("unterminated hex string").span(span).emit();
-                    (TokenLitKind::Err(guar), self.symbol_from_to(start, end))
-                } else {
-                    self.cook_quoted(TokenLitKind::HexStr, start, end)
+                    (kind.into(), self.cook_quoted(kind, start, end))
                 }
             }
             RawLiteralKind::Int { base, empty_int } => {
@@ -366,42 +360,12 @@ impl<'sess, 'src> Lexer<'sess, 'src> {
         }
     }
 
-    fn cook_quoted(
-        &self,
-        kind: TokenLitKind,
-        start: BytePos,
-        end: BytePos,
-    ) -> (TokenLitKind, Symbol) {
-        let (mode, prefix_len) = match kind {
-            TokenLitKind::Str => (unescape::Mode::Str, 0),
-            TokenLitKind::UnicodeStr => (unescape::Mode::UnicodeStr, 7),
-            TokenLitKind::HexStr => (unescape::Mode::HexStr, 3),
-            _ => unreachable!(),
-        };
-
+    fn cook_quoted(&self, kind: StrKind, start: BytePos, end: BytePos) -> Symbol {
         // Account for quote (`"` or `'`) and prefix.
-        let content_start = start + 1 + BytePos(prefix_len);
+        let content_start = start + 1 + BytePos(kind.prefix().len() as u32);
         let content_end = end - 1;
         let lit_content = self.str_from_to(content_start, content_end);
-
-        let mut has_err = false;
-        unescape::unescape_literal(lit_content, mode, |range, result| {
-            // Here we only check for errors. The actual unescaping is done later.
-            if let Err(err) = result {
-                has_err = true;
-                let (start, end) = (range.start as u32, range.end as u32);
-                let lo = content_start + BytePos(start);
-                let hi = lo + BytePos(end - start);
-                let span = self.new_span(lo, hi);
-                unescape::emit_unescape_error(self.dcx(), lit_content, span, range, err);
-            }
-        });
-
-        // We normally exclude the quotes for the symbol, but for errors we
-        // include it because it results in clearer error messages.
-        let symbol =
-            if has_err { self.symbol_from_to(start, end) } else { Symbol::intern(lit_content) };
-        (kind, symbol)
+        Symbol::intern(lit_content)
     }
 
     #[inline]
@@ -449,11 +413,7 @@ impl Iterator for Lexer<'_, '_> {
     #[inline]
     fn next(&mut self) -> Option<Token> {
         let token = self.next_token();
-        if token.is_eof() {
-            None
-        } else {
-            Some(token)
-        }
+        if token.is_eof() { None } else { Some(token) }
     }
 }
 
@@ -473,9 +433,9 @@ fn escaped_char(c: char) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ops::Range;
     use BinOpToken::*;
     use TokenKind::*;
+    use std::ops::Range;
 
     type Expected<'a> = &'a [(Range<usize>, TokenKind)];
 
@@ -530,7 +490,7 @@ mod tests {
     #[test]
     fn literals() {
         use TokenLitKind::*;
-        solar_interface::SessionGlobals::new().set(|| {
+        solar_interface::SessionGlobals::default().set(|| {
             checks(&[
                 ("\"\"", &[(0..2, lit(Str, ""))]),
                 ("\"\"\"\"", &[(0..2, lit(Str, "")), (2..4, lit(Str, ""))]),
@@ -576,7 +536,7 @@ mod tests {
 
     #[test]
     fn idents() {
-        solar_interface::SessionGlobals::new().set(|| {
+        solar_interface::SessionGlobals::default().set(|| {
             checks(&[
                 ("$", &[(0..1, id("$"))]),
                 ("a$", &[(0..2, id("a$"))]),
@@ -598,7 +558,7 @@ mod tests {
             Comment(true, kind, sym(symbol))
         }
 
-        solar_interface::SessionGlobals::new().set(|| {
+        solar_interface::SessionGlobals::default().set(|| {
             checks(&[
                 ("// line comment", &[]),
                 ("// / line comment", &[]),

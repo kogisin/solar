@@ -5,8 +5,8 @@ use derive_more::derive::From;
 use either::Either;
 use rayon::prelude::*;
 use solar_ast as ast;
-use solar_data_structures::{index::IndexVec, newtype_index, BumpExt};
-use solar_interface::{diagnostics::ErrorGuaranteed, source_map::SourceFile, Ident, Span};
+use solar_data_structures::{BumpExt, index::IndexVec, newtype_index};
+use solar_interface::{Ident, Span, diagnostics::ErrorGuaranteed, source_map::SourceFile};
 use std::{fmt, ops::ControlFlow, sync::Arc};
 use strum::EnumIs;
 
@@ -32,12 +32,11 @@ impl Arena {
 
     pub fn allocated_bytes(&self) -> usize {
         self.bump.allocated_bytes()
-            + (self.literals.len() + self.literals.uninitialized_array().len())
-                * std::mem::size_of::<Lit>()
+            + (self.literals.len() + self.literals.uninitialized_array().len()) * size_of::<Lit>()
     }
 
     pub fn used_bytes(&self) -> usize {
-        self.bump.used_bytes() + self.literals.len() * std::mem::size_of::<Lit>()
+        self.bump.used_bytes() + self.literals.len() * size_of::<Lit>()
     }
 }
 
@@ -97,7 +96,7 @@ macro_rules! indexvec_methods {
 
             #[doc = "Returns an iterator over all of the " $singular " IDs."]
             #[inline]
-            pub fn [<$singular _ids>](&self) -> impl ExactSizeIterator<Item = $id> + Clone {
+            pub fn [<$singular _ids>](&self) -> impl ExactSizeIterator<Item = $id> + Clone + use<> {
                 // SAFETY: `$plural` is an IndexVec, which guarantees that all indexes are in bounds
                 // of the respective index type.
                 (0..self.$plural.len()).map(|id| unsafe { $id::from_usize_unchecked(id) })
@@ -105,7 +104,7 @@ macro_rules! indexvec_methods {
 
             #[doc = "Returns a parallel iterator over all of the " $singular " IDs."]
             #[inline]
-            pub fn [<par_ $singular _ids>](&self) -> impl IndexedParallelIterator<Item = $id> {
+            pub fn [<par_ $singular _ids>](&self) -> impl IndexedParallelIterator<Item = $id> + use<> {
                 // SAFETY: `$plural` is an IndexVec, which guarantees that all indexes are in bounds
                 // of the respective index type.
                 (0..self.$plural.len()).into_par_iter().map(|id| unsafe { $id::from_usize_unchecked(id) })
@@ -284,9 +283,7 @@ newtype_index! {
 
     /// A [`Variable`] ID.
     pub struct VariableId;
-}
 
-newtype_index! {
     /// An [`Expr`] ID.
     pub struct ExprId;
 }
@@ -379,6 +376,21 @@ impl<'hir> Item<'_, 'hir> {
             Item::Error(e) => e.contract,
             Item::Event(e) => e.contract,
             Item::Variable(v) => v.contract,
+        }
+    }
+
+    /// Returns the source ID where this item is defined.
+    #[inline]
+    pub fn source(self) -> SourceId {
+        match self {
+            Item::Contract(c) => c.source,
+            Item::Function(f) => f.source,
+            Item::Struct(s) => s.source,
+            Item::Enum(e) => e.source,
+            Item::Udvt(u) => u.source,
+            Item::Error(e) => e.source,
+            Item::Event(e) => e.source,
+            Item::Variable(v) => v.source,
         }
     }
 
@@ -483,29 +495,17 @@ impl ItemId {
 
     /// Returns the contract ID if this is a contract.
     pub fn as_contract(&self) -> Option<ContractId> {
-        if let Self::Contract(v) = *self {
-            Some(v)
-        } else {
-            None
-        }
+        if let Self::Contract(v) = *self { Some(v) } else { None }
     }
 
     /// Returns the function ID if this is a function.
     pub fn as_function(&self) -> Option<FunctionId> {
-        if let Self::Function(v) = *self {
-            Some(v)
-        } else {
-            None
-        }
+        if let Self::Function(v) = *self { Some(v) } else { None }
     }
 
     /// Returns the variable ID if this is a variable.
     pub fn as_variable(&self) -> Option<VariableId> {
-        if let Self::Variable(v) = *self {
-            Some(v)
-        } else {
-            None
-        }
+        if let Self::Variable(v) = *self { Some(v) } else { None }
     }
 }
 
@@ -522,10 +522,19 @@ pub struct Contract<'hir> {
     pub kind: ContractKind,
     /// The contract bases, as declared in the source code.
     pub bases: &'hir [ContractId],
+    /// The base arguments, as declared in the source code.
+    pub bases_args: &'hir [Modifier<'hir>],
     /// The linearized contract bases.
     ///
     /// The first element is the contract itself, followed by its bases in order of inheritance.
     pub linearized_bases: &'hir [ContractId],
+    /// The constructor base arguments (if any).
+    ///
+    /// The index maps to the position in `linearized_bases[1..]`.
+    ///
+    /// The reference points to either `bases_args` in the original contract, or `modifiers` in the
+    /// constructor.
+    pub linearized_bases_args: &'hir [Option<&'hir Modifier<'hir>>],
     /// The resolved constructor function.
     pub ctor: Option<FunctionId>,
     /// The resolved `fallback` function.
@@ -574,6 +583,17 @@ impl Contract<'_> {
     }
 }
 
+/// A modifier or base class call.
+#[derive(Clone, Copy, Debug)]
+pub struct Modifier<'hir> {
+    /// The span of the modifier or base class call.
+    pub span: Span,
+    /// The modifier or base class ID.
+    pub id: ItemId,
+    /// The arguments to the modifier or base class call.
+    pub args: CallArgs<'hir>,
+}
+
 /// A function.
 #[derive(Debug)]
 pub struct Function<'hir> {
@@ -593,7 +613,7 @@ pub struct Function<'hir> {
     /// The state mutability of the function.
     pub state_mutability: StateMutability,
     /// Modifiers, or base classes if this is a constructor.
-    pub modifiers: &'hir [ItemId],
+    pub modifiers: &'hir [Modifier<'hir>],
     /// Whether this function is marked with the `virtual` keyword.
     pub marked_virtual: bool,
     /// Whether this function is marked with the `virtual` keyword or is defined in an interface.
@@ -644,11 +664,7 @@ impl Function<'_> {
 
     /// Returns the description of the function.
     pub fn description(&self) -> &'static str {
-        if self.is_getter() {
-            "getter function"
-        } else {
-            self.kind.to_str()
-        }
+        if self.is_getter() { "getter function" } else { self.kind.to_str() }
     }
 }
 
@@ -710,14 +726,6 @@ pub struct Event<'hir> {
     /// Whether this event is anonymous.
     pub anonymous: bool,
     pub parameters: &'hir [VariableId],
-}
-
-/// An event parameter.
-#[derive(Debug)]
-pub struct EventParameter<'hir> {
-    pub ty: Type<'hir>,
-    pub indexed: bool,
-    pub name: Option<Ident>,
 }
 
 /// A custom error.
@@ -926,7 +934,21 @@ impl VarKind {
 }
 
 /// A block of statements.
-pub type Block<'hir> = &'hir [Stmt<'hir>];
+#[derive(Clone, Copy, Debug)]
+pub struct Block<'hir> {
+    /// The span of the block, including the `{` and `}`.
+    pub span: Span,
+    /// The statements in the block.
+    pub stmts: &'hir [Stmt<'hir>],
+}
+
+impl<'hir> std::ops::Deref for Block<'hir> {
+    type Target = [Stmt<'hir>];
+
+    fn deref(&self) -> &Self::Target {
+        self.stmts
+    }
+}
 
 /// A statement.
 #[derive(Debug)]
@@ -1014,8 +1036,14 @@ pub struct StmtTry<'hir> {
 /// Reference: <https://docs.soliditylang.org/en/latest/grammar.html#a4.SolidityParser.catchClause>
 #[derive(Debug)]
 pub struct TryCatchClause<'hir> {
+    /// The span of the entire clause, from the `returns` and `catch`
+    /// keywords, to the closing brace of the block.
+    pub span: Span,
+    /// The catch clause name: `Error`, `Panic`, or custom.
     pub name: Option<Ident>,
+    /// The parameter list for the clause.
     pub args: &'hir [VariableId],
+    /// A block of statements
     pub block: Block<'hir>,
 }
 
@@ -1109,11 +1137,7 @@ impl Res {
     }
 
     pub fn as_variable(&self) -> Option<VariableId> {
-        if let Self::Item(id) = self {
-            id.as_variable()
-        } else {
-            None
-        }
+        if let Self::Item(id) = self { id.as_variable() } else { None }
     }
 }
 
@@ -1205,13 +1229,19 @@ pub struct NamedArg<'hir> {
 }
 
 /// A list of function call arguments.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct CallArgs<'hir> {
     /// The span of the arguments. This points to the parenthesized list of arguments.
     ///
-    /// If the list is empty, this points to the empty `()` or to where the `(` would be.
+    /// If the list is empty, this points to the empty `()`/`({})` or to where the `(` would be.
     pub span: Span,
     pub kind: CallArgsKind<'hir>,
+}
+
+impl<'hir> Default for CallArgs<'hir> {
+    fn default() -> Self {
+        Self::empty(Span::DUMMY)
+    }
 }
 
 impl<'hir> CallArgs<'hir> {
@@ -1250,7 +1280,7 @@ impl<'hir> CallArgs<'hir> {
 }
 
 /// A list of function call argument expressions.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum CallArgsKind<'hir> {
     /// A list of unnamed arguments: `(1, 2, 3)`.
     Unnamed(&'hir [Expr<'hir>]),

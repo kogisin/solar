@@ -36,6 +36,7 @@ impl<'sess, 'ast> Parser<'sess, 'ast> {
         } else if self.eat_keyword(kw::Function) {
             self.parse_function_header(FunctionFlags::FUNCTION_TY).map(|f| {
                 let FunctionHeader {
+                    span: _,
                     name: _,
                     parameters,
                     visibility,
@@ -215,7 +216,7 @@ fn parse_ty_size_u8(
     let mut n = s.parse::<u16>().map_err(ParseTySizeError::Parse)?;
 
     if to_bytes {
-        if n % 8 != 0 {
+        if !n.is_multiple_of(8) {
             return Err(ParseTySizeError::NotMultipleOf8);
         }
         n /= 8;

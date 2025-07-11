@@ -1,10 +1,10 @@
 //! Solidity source code token.
 
 use crate::{
+    DocComment, StrKind,
     ast::{BinOp, BinOpKind, UnOp, UnOpKind},
-    DocComment,
 };
-use solar_interface::{diagnostics::ErrorGuaranteed, Ident, Span, Symbol};
+use solar_interface::{Ident, Span, Symbol, diagnostics::ErrorGuaranteed};
 use std::{borrow::Cow, fmt};
 
 /// The type of a comment.
@@ -189,6 +189,16 @@ pub enum TokenLitKind {
     HexStr,
     /// An error occurred while lexing the literal token.
     Err(ErrorGuaranteed),
+}
+
+impl From<StrKind> for TokenLitKind {
+    fn from(str_kind: StrKind) -> Self {
+        match str_kind {
+            StrKind::Str => Self::Str,
+            StrKind::Unicode => Self::UnicodeStr,
+            StrKind::Hex => Self::HexStr,
+        }
+    }
 }
 
 impl TokenLitKind {
@@ -478,7 +488,7 @@ impl TokenKind {
             Le | EqEq | Ne | Ge | AndAnd | OrOr | Tilde | Walrus | PlusPlus | MinusMinus
             | StarStar | BinOpEq(_) | At | Dot | Comma | Semi | Arrow | FatArrow | Question
             | OpenDelim(_) | CloseDelim(_) | Literal(..) | Ident(_) | Comment(..) | Eof => {
-                return None
+                return None;
             }
         })
     }

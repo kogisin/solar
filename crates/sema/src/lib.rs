@@ -10,8 +10,8 @@
 extern crate tracing;
 
 use rayon::prelude::*;
-use solar_data_structures::{trustme, OnDrop};
-use solar_interface::{config::CompilerStage, Result, Session};
+use solar_data_structures::{OnDrop, trustme};
+use solar_interface::{Result, Session, config::CompilerStage};
 use thread_local::ThreadLocal;
 use ty::Gcx;
 
@@ -40,6 +40,8 @@ mod typeck;
 mod emit;
 
 pub mod stats;
+
+mod span_visitor;
 
 /// Thin wrapper around the global context to ensure it is accessed and dropped correctly.
 pub struct GcxWrapper<'gcx>(std::mem::ManuallyDrop<ty::GlobalCtxt<'gcx>>);
@@ -95,15 +97,25 @@ pub(crate) fn parse_and_lower<'hir, 'sess: 'hir>(
     });
     let mut sources = pcx.parse(&ast_arenas);
 
-    if let Some(dump) = &sess.opts.unstable.dump {
-        if dump.kind.is_ast() {
-            dump_ast(sess, &sources, dump.paths.as_deref())?;
-        }
+    if let Some(dump) = &sess.opts.unstable.dump
+        && dump.kind.is_ast()
+    {
+        dump_ast(sess, &sources, dump.paths.as_deref())?;
     }
 
     if sess.opts.unstable.ast_stats {
         for source in sources.asts() {
             stats::print_ast_stats(source, "AST STATS", "ast-stats");
+        }
+    }
+
+    if sess.opts.unstable.span_visitor {
+        use crate::span_visitor::SpanVisitor;
+        use ast::visit::Visit;
+        for source in sources.asts() {
+            let mut visitor = SpanVisitor::new(sess);
+            let _ = visitor.visit_source_unit(source);
+            debug!(spans_visited = visitor.count(), "span visitor completed");
         }
     }
 
@@ -152,10 +164,10 @@ fn lower<'sess, 'hir>(
 /// This is not yet exposed publicly as it is not yet fully implemented.
 #[instrument(level = "debug", skip_all)]
 fn analysis(gcx: Gcx<'_>) -> Result<()> {
-    if let Some(dump) = &gcx.sess.opts.unstable.dump {
-        if dump.kind.is_hir() {
-            dump_hir(gcx, dump.paths.as_deref())?;
-        }
+    if let Some(dump) = &gcx.sess.opts.unstable.dump
+        && dump.kind.is_hir()
+    {
+        dump_hir(gcx, dump.paths.as_deref())?;
     }
 
     // Lower HIR types.

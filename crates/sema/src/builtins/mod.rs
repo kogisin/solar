@@ -4,7 +4,7 @@ use crate::{
     ty::{Gcx, Ty},
 };
 use solar_ast::StateMutability as SM;
-use solar_interface::{kw, sym, Span, Symbol};
+use solar_interface::{Span, Symbol, kw, sym};
 
 pub(crate) mod members;
 pub use members::{Member, MemberList};
@@ -264,8 +264,8 @@ impl Builtin {
     const fn from_index(i: usize) -> Option<Self> {
         const {
             assert!(Self::COUNT <= Primitive::MAX as usize);
-            assert!(std::mem::size_of::<Self>() == 1);
-        };
+            assert!(size_of::<Self>() == 1);
+        }
         if i < Self::COUNT {
             // SAFETY:
             //

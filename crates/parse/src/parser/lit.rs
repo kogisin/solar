@@ -1,9 +1,9 @@
-use crate::{unescape, PResult, Parser};
+use crate::{PResult, Parser, unescape};
 use num_bigint::{BigInt, BigUint};
 use num_rational::BigRational;
 use num_traits::{Num, Signed, Zero};
 use solar_ast::{token::*, *};
-use solar_interface::{diagnostics::ErrorGuaranteed, kw, Symbol};
+use solar_interface::{Symbol, diagnostics::ErrorGuaranteed, kw};
 use std::{borrow::Cow, fmt};
 
 impl<'sess, 'ast> Parser<'sess, 'ast> {
@@ -151,22 +151,24 @@ impl<'sess, 'ast> Parser<'sess, 'ast> {
     /// Parses a string literal.
     fn parse_lit_str(&mut self, lit: TokenLit) -> PResult<'sess, LitKind> {
         let mode = match lit.kind {
-            TokenLitKind::Str => unescape::Mode::Str,
-            TokenLitKind::UnicodeStr => unescape::Mode::UnicodeStr,
-            TokenLitKind::HexStr => unescape::Mode::HexStr,
+            TokenLitKind::Str => StrKind::Str,
+            TokenLitKind::UnicodeStr => StrKind::Unicode,
+            TokenLitKind::HexStr => StrKind::Hex,
             _ => unreachable!(),
         };
 
-        let mut value = unescape::parse_string_literal(lit.symbol.as_str(), mode);
+        let span = self.prev_token.span;
+        let (mut value, _) =
+            unescape::parse_string_literal(lit.symbol.as_str(), mode, span, self.sess);
         let mut extra = vec![];
         while let Some(TokenLit { symbol, kind }) = self.token.lit() {
             if kind != lit.kind {
                 break;
             }
             extra.push((self.token.span, symbol));
-            value
-                .to_mut()
-                .extend_from_slice(&unescape::parse_string_literal(symbol.as_str(), mode));
+            let (parsed, _) =
+                unescape::parse_string_literal(symbol.as_str(), mode, self.token.span, self.sess);
+            value.to_mut().extend_from_slice(&parsed);
             self.bump();
         }
 
@@ -230,10 +232,11 @@ fn parse_integer(symbol: Symbol) -> Result<LitKind, LitError> {
     }
 
     // Address literal.
-    if base == Base::Hexadecimal && s.len() == 42 {
-        if let Ok(address) = s.parse() {
-            return Ok(LitKind::Address(address));
-        }
+    if base == Base::Hexadecimal
+        && s.len() == 42
+        && let Ok(address) = s.parse()
+    {
+        return Ok(LitKind::Address(address));
     }
 
     let start = if base == Base::Decimal { 0 } else { 2 };
@@ -397,18 +400,13 @@ fn big_int_from_str_radix(s: &str, base: Base, rat: bool) -> Result<BigInt, LitE
     if s.len() > max_digits::<MAX_BITS>(base) {
         return Err(if rat { LitError::RationalTooLarge } else { LitError::IntegerTooLarge });
     }
-    if s.len() <= max_digits::<{ Primitive::BITS }>(base) {
-        if let Ok(n) = Primitive::from_str_radix(s, base as u32) {
-            return Ok(BigInt::from(n));
-        }
+    if s.len() <= max_digits::<{ Primitive::BITS }>(base)
+        && let Ok(n) = Primitive::from_str_radix(s, base as u32)
+    {
+        return Ok(BigInt::from(n));
     }
-    BigInt::from_str_radix(s, base as u32).map_err(|e| {
-        if rat {
-            LitError::ParseRational(e)
-        } else {
-            LitError::ParseInteger(e)
-        }
-    })
+    BigInt::from_str_radix(s, base as u32)
+        .map_err(|e| if rat { LitError::ParseRational(e) } else { LitError::ParseInteger(e) })
 }
 
 /// Checks whether mantissa * (10 ** exp) fits into [`MAX_BITS`] bits.
@@ -455,7 +453,7 @@ fn strip_underscores(symbol: &Symbol) -> Cow<'_, str> {
 mod tests {
     use super::*;
     use crate::Lexer;
-    use alloy_primitives::{address, Address};
+    use alloy_primitives::{Address, address};
     use solar_interface::Session;
 
     // String literal parsing is tested in ../lexer/mod.rs.
