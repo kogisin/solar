@@ -1,7 +1,6 @@
 //! Constant and mutable AST visitor trait definitions.
 
 use crate::ast::*;
-use solar_data_structures::trustme;
 use solar_interface::{Ident, Span, Spanned};
 use solar_macros::declare_visitors;
 use std::ops::ControlFlow;
@@ -15,9 +14,7 @@ declare_visitors! {
         /// should never break.
         type BreakValue;
 
-        fn visit_source_unit(&mut self, source_unit: &#mut SourceUnit<'ast>) -> ControlFlow<Self::BreakValue> {
-            // TODO: SAFETY: Idk
-            let source_unit = unsafe { trustme::decouple_lt #_mut(source_unit) };
+        fn visit_source_unit(&mut self, source_unit: &'ast #mut SourceUnit<'ast>) -> ControlFlow<Self::BreakValue> {
             let SourceUnit { items } = source_unit;
             for item in items.iter #_mut() {
                 self.visit_item #_mut(item)?;
@@ -224,7 +221,7 @@ declare_visitors! {
                 state_mutability,
                 modifiers,
                 virtual_: _,
-                override_: _,
+                override_,
                 returns,
             } = header;
             self.visit_span #_mut(span)?;
@@ -246,6 +243,9 @@ declare_visitors! {
             if let Some(returns) = returns {
                 self.visit_parameter_list #_mut(returns)?;
             }
+            if let Some(override_) = override_ {
+                self.visit_override #_mut(override_)?;
+            }
             ControlFlow::Continue(())
         }
 
@@ -253,6 +253,15 @@ declare_visitors! {
             let Modifier { name, arguments } = modifier;
             self.visit_path #_mut(name)?;
             self.visit_call_args #_mut(arguments)?;
+            ControlFlow::Continue(())
+        }
+
+        fn visit_override(&mut self, override_: &'ast #mut Override<'ast>) -> ControlFlow<Self::BreakValue> {
+            let Override { span, paths } = override_;
+            self.visit_span #_mut(span)?;
+            for path in paths.iter #_mut() {
+                self.visit_path #_mut(path)?;
+            }
             ControlFlow::Continue(())
         }
 
@@ -485,7 +494,7 @@ declare_visitors! {
             ControlFlow::Continue(())
         }
 
-        fn visit_lit(&mut self, lit: &'ast #mut Lit) -> ControlFlow<Self::BreakValue> {
+        fn visit_lit(&mut self, lit: &'ast #mut Lit<'_>) -> ControlFlow<Self::BreakValue> {
             let Lit { span, symbol: _, kind: _ } = lit;
             self.visit_span #_mut(span)?;
             ControlFlow::Continue(())

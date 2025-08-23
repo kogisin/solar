@@ -29,13 +29,19 @@ impl SessionGlobals {
     }
 
     /// Sets this instance as the global instance for the duration of the closure.
-    #[inline]
-    #[track_caller]
     pub fn set<R>(&self, f: impl FnOnce() -> R) -> R {
-        if cfg!(debug_assertions) && SESSION_GLOBALS.is_set() {
-            check_overwrite(self);
-        }
+        self.check_overwrite();
         SESSION_GLOBALS.set(self, f)
+    }
+
+    fn check_overwrite(&self) {
+        Self::try_with(|prev| {
+            if let Some(prev) = prev
+                && !prev.maybe_eq(self)
+            {
+                overwrite_log();
+            }
+        });
     }
 
     /// Insert `source_map` into the session globals for the duration of the closure's execution.
@@ -53,18 +59,11 @@ impl SessionGlobals {
     #[inline]
     #[track_caller]
     pub fn with<R>(f: impl FnOnce(&Self) -> R) -> R {
-        #[cfg(debug_assertions)]
-        if !SESSION_GLOBALS.is_set() {
-            let msg = if rayon::current_thread_index().is_some() {
-                "cannot access a scoped thread local variable without calling `set` first;\n\
-                 did you forget to call `Session::enter_parallel`?"
-            } else {
-                "cannot access a scoped thread local variable without calling `set` first;\n\
-                 did you forget to call `Session::enter`, or `Session::enter_parallel` \
-                 if using Rayon?"
-            };
-            panic!("{msg}");
-        }
+        debug_assert!(
+            SESSION_GLOBALS.is_set(),
+            "cannot access a scoped thread local variable without calling `set` first; \
+             did you forget to call `Session::enter`?"
+        );
         SESSION_GLOBALS.with(f)
     }
 
@@ -82,28 +81,21 @@ impl SessionGlobals {
         SESSION_GLOBALS.is_set()
     }
 
-    fn maybe_eq(&self, other: &Self) -> bool {
-        // Extra check for test usage of `enter`:
-        // we allow replacing empty source maps with eachother.
-        std::ptr::eq(self, other) || (self.is_default() && other.is_default())
+    pub(crate) fn try_with<R>(f: impl FnOnce(Option<&Self>) -> R) -> R {
+        if SESSION_GLOBALS.is_set() { SESSION_GLOBALS.with(|g| f(Some(g))) } else { f(None) }
     }
 
-    fn is_default(&self) -> bool {
-        self.source_map.is_empty()
+    pub(crate) fn maybe_eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
     }
 }
 
-#[cold]
 #[inline(never)]
-#[cfg_attr(debug_assertions, track_caller)]
-fn check_overwrite(new: &SessionGlobals) {
-    SessionGlobals::with(|old| {
-        if !old.maybe_eq(new) {
-            panic!(
-                "SESSION_GLOBALS should never be overwritten!\n\
-                 This is likely either due to manual incorrect usage of `SessionGlobals`, \
-                 or entering multiple nested `Session`s, which is not supported"
-            );
-        }
-    })
+#[cold]
+fn overwrite_log() {
+    debug!(
+        "overwriting SESSION_GLOBALS; \
+         this might be due to manual incorrect usage of `SessionGlobals`, \
+         or entering multiple different nested `Session`s, which may cause unexpected behavior"
+    );
 }

@@ -8,16 +8,44 @@ fn micro_benches(c: &mut Criterion) {
     g.bench_function("session/new", |b| {
         b.iter(|| solar_parse::interface::Session::builder().with_stderr_emitter().build());
     });
-    g.bench_function("session/enter", |b| {
+
+    {
         let sess =
             &black_box(solar_parse::interface::Session::builder().with_stderr_emitter().build());
-        let n: usize = black_box(10_000);
-        b.iter(|| {
-            for _ in 0..n {
-                black_box(sess).enter(|| black_box(sess));
-            }
+
+        g.bench_function("session/enter", |b| {
+            b.iter(|| black_box(sess).enter(|| black_box(sess)));
         });
-    });
+        g.bench_function("session/enter_sequential", |b| {
+            let n: usize = black_box(10_000);
+            b.iter(|| {
+                for _ in 0..n {
+                    black_box(sess).enter_sequential(|| black_box(sess));
+                }
+            });
+        });
+
+        g.bench_function("session/enter/reentrant", |b| {
+            sess.enter(|| {
+                let n: usize = black_box(10_000);
+                b.iter(|| {
+                    for _ in 0..n {
+                        black_box(sess).enter(|| black_box(sess));
+                    }
+                });
+            });
+        });
+        g.bench_function("session/enter_sequential/reentrant", |b| {
+            sess.enter(|| {
+                let n: usize = black_box(10_000);
+                b.iter(|| {
+                    for _ in 0..n {
+                        black_box(sess).enter_sequential(|| black_box(sess));
+                    }
+                });
+            });
+        });
+    }
 
     g.bench_function("source_map/new_source_file", |b| {
         let source = black_box(get_src("Optimism"));
@@ -46,11 +74,6 @@ fn parser_benches(c: &mut Criterion) {
     for &Source { name: sname, path: _, src } in get_srcs() {
         for &parser in PARSERS {
             let pname = parser.name();
-
-            // TODO: https://github.com/JoranHonig/tree-sitter-solidity/issues/73
-            if pname == "tree-sitter" && matches!(sname, "Seaport" | "Optimism") {
-                continue;
-            }
 
             let mk_id = |id: &str| {
                 if PARSERS.len() == 1 {

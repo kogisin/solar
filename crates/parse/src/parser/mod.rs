@@ -20,6 +20,14 @@ mod ty;
 mod yul;
 
 /// Solidity and Yul parser.
+///
+/// # Examples
+///
+/// ```
+/// # mod solar { pub use {solar_ast as ast, solar_interface as interface, solar_parse as parse}; }
+/// # fn main() {}
+#[doc = include_str!("../../doc-examples/parser.rs")]
+/// ```
 pub struct Parser<'sess, 'ast> {
     /// The parser session.
     pub sess: &'sess Session,
@@ -805,6 +813,7 @@ impl<'sess, 'ast> Parser<'sess, 'ast> {
     }
 
     /// Runs `f` with the parser in a contract context.
+    #[inline]
     fn in_contract<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let old = std::mem::replace(&mut self.in_contract, true);
         let res = f(self);
@@ -813,6 +822,7 @@ impl<'sess, 'ast> Parser<'sess, 'ast> {
     }
 
     /// Runs `f` with the parser in a Yul context.
+    #[inline]
     fn in_yul<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let old = std::mem::replace(&mut self.in_yul, true);
         let res = f(self);

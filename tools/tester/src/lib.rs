@@ -46,11 +46,8 @@ pub fn run_tests(cmd: &'static Path) -> Result<()> {
         let cfg = MyConfig::<'static> { mode, tmp_dir };
         let config = config(cmd, &args, mode);
 
-        let text_emitter = match args.format {
-            ui_test::Format::Terse => ui_test::status_emitter::Text::quiet(),
-            ui_test::Format::Pretty => ui_test::status_emitter::Text::verbose(),
-        };
-        let gha_emitter = ui_test::status_emitter::Gha::<true> { name: mode.to_string() };
+        let text_emitter: Box<dyn ui_test::status_emitter::StatusEmitter> = args.format.into();
+        let gha_emitter = ui_test::status_emitter::Gha { name: mode.to_string(), group: true };
         let status_emitter = (text_emitter, gha_emitter);
 
         ui_test::run_tests_generic(
@@ -90,7 +87,7 @@ fn config(cmd: &'static Path, args: &ui_test::Args, mode: Mode) -> ui_test::Conf
                 let mut args =
                     vec!["-j1", "--error-format=rustc-json", "-Zui-testing", "-Zparse-yul"];
                 if mode.is_solc() {
-                    args.push("--stop-after=parsed-and-imported");
+                    args.push("--stop-after=parsing");
                 }
                 args.into_iter().map(Into::into).collect()
             },
