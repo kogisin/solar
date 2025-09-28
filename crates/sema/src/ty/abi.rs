@@ -41,7 +41,7 @@ impl<'gcx> Gcx<'gcx> {
         for f in self.interface_functions(id) {
             items.push(self.function_abi(f.id).into());
         }
-        // TODO: Does not include referenced items.
+        // TODO: Does not include referenced items: https://github.com/paradigmxyz/solar/issues/305
         // See solc `interfaceEvents` and `interfaceErrors`.
         for item in self.hir.contract_item_ids(id) {
             match item {
@@ -51,10 +51,9 @@ impl<'gcx> Gcx<'gcx> {
             }
         }
 
-        // https://github.com/ethereum/solidity/blob/87d86bfba64d8b88537a4a85c1d71f521986b614/libsolidity/interface/ABI.cpp#L43-L47
+        // https://github.com/argotorg/solidity/blob/87d86bfba64d8b88537a4a85c1d71f521986b614/libsolidity/interface/ABI.cpp#L43-L47
         fn cmp_key<'a>(item: &'a json::AbiItem<'_>) -> impl Ord + use<'a> {
-            // TODO: Use `json_type` instead of `debug_name`.
-            (item.debug_name(), item.name())
+            (item.json_type(), item.name())
         }
         items.sort_by(|a, b| cmp_key(a).cmp(&cmp_key(b)));
 
@@ -245,7 +244,7 @@ impl<'gcx, W: fmt::Write> TyAbiPrinter<'gcx, W> {
 ///
 /// This is mainly used in the `internalType` field of the ABI.
 ///
-/// Example: <https://github.com/ethereum/solidity/blob/9d7cc42bc1c12bb43e9dccf8c6c36833fdfcbbca/libsolidity/ast/Types.cpp#L2352-L2358>
+/// Example: <https://github.com/argotorg/solidity/blob/9d7cc42bc1c12bb43e9dccf8c6c36833fdfcbbca/libsolidity/ast/Types.cpp#L2352-L2358>
 pub(crate) struct TySolcPrinter<'gcx, W> {
     gcx: Gcx<'gcx>,
     buf: W,

@@ -3,7 +3,7 @@ use super::{
 };
 use crate::token::Token;
 use either::Either;
-use solar_interface::{Ident, Span, Spanned};
+use solar_interface::{Ident, Span, Spanned, Symbol};
 use std::{
     fmt,
     ops::{Deref, DerefMut},
@@ -218,9 +218,9 @@ impl PragmaTokens<'_> {
 /// This is used in `pragma` declaration because Solc for some reason accepts and treats both as
 /// identical.
 ///
-/// Parsed in: <https://github.com/ethereum/solidity/blob/194b114664c7daebc2ff68af3c573272f5d28913/libsolidity/parsing/Parser.cpp#L235>
+/// Parsed in: <https://github.com/argotorg/solidity/blob/194b114664c7daebc2ff68af3c573272f5d28913/libsolidity/parsing/Parser.cpp#L235>
 ///
-/// Syntax-checked in: <https://github.com/ethereum/solidity/blob/194b114664c7daebc2ff68af3c573272f5d28913/libsolidity/analysis/SyntaxChecker.cpp#L77>
+/// Syntax-checked in: <https://github.com/argotorg/solidity/blob/194b114664c7daebc2ff68af3c573272f5d28913/libsolidity/analysis/SyntaxChecker.cpp#L77>
 #[derive(Clone, Debug)]
 pub enum IdentOrStrLit {
     /// An identifier.
@@ -230,6 +230,14 @@ pub enum IdentOrStrLit {
 }
 
 impl IdentOrStrLit {
+    /// Returns the value of the identifier or literal.
+    pub fn value(&self) -> Symbol {
+        match self {
+            Self::Ident(ident) => ident.name,
+            Self::StrLit(str_lit) => str_lit.value,
+        }
+    }
+
     /// Returns the string value of the identifier or literal.
     pub fn as_str(&self) -> &str {
         match self {

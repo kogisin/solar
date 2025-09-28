@@ -5,6 +5,7 @@ use crate::{
 use solar_data_structures::trustme;
 use solar_interface::{Result, Session, diagnostics::DiagCtxt};
 use std::{
+    fmt,
     marker::PhantomPinned,
     mem::{ManuallyDrop, MaybeUninit},
     ops::ControlFlow,
@@ -32,6 +33,12 @@ use thread_local::ThreadLocal;
 #[doc = include_str!("../doc-examples/hir.rs")]
 /// ```
 pub struct Compiler(ManuallyDrop<Pin<Box<CompilerInner<'static>>>>);
+
+impl fmt::Debug for Compiler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.enter_sequential(|compiler| compiler.debug_fmt("Compiler", f))
+    }
+}
 
 struct CompilerInner<'a> {
     sess: Session,
@@ -70,6 +77,12 @@ impl Compiler {
         &self.0.sess
     }
 
+    /// Returns a mutable reference to the compiler session.
+    #[inline]
+    pub fn sess_mut(&mut self) -> &mut Session {
+        self.as_mut().sess_mut()
+    }
+
     /// Returns a reference to the diagnostics context.
     #[inline]
     pub fn dcx(&self) -> &DiagCtxt {
@@ -79,10 +92,12 @@ impl Compiler {
     /// Returns a mutable reference to the diagnostics context.
     #[inline]
     pub fn dcx_mut(&mut self) -> &mut DiagCtxt {
-        self.as_mut().dcx_mut()
+        &mut self.sess_mut().dcx
     }
 
     /// Enters the compiler context.
+    ///
+    /// See [`Session::enter`](Session::enter) for more details.
     pub fn enter<T: Send>(&self, f: impl FnOnce(&CompilerRef<'_>) -> T + Send) -> T {
         self.0.sess.enter(|| f(CompilerRef::new(&self.0)))
     }
@@ -91,10 +106,36 @@ impl Compiler {
     ///
     /// This is currently only necessary when parsing sources and lowering the ASTs.
     /// All accesses after can make use of `gcx`, passed by immutable reference.
+    ///
+    /// See [`Session::enter`](Session::enter) for more details.
     pub fn enter_mut<T: Send>(&mut self, f: impl FnOnce(&mut CompilerRef<'_>) -> T + Send) -> T {
         // SAFETY: `sess` is not modified.
         let sess = unsafe { trustme::decouple_lt(&self.0.sess) };
         sess.enter(|| f(self.as_mut()))
+    }
+
+    /// Enters the compiler context.
+    ///
+    /// Note that this does not set up the rayon thread pool. This is only useful when parsing
+    /// sequentially, like manually using `Parser`. Otherwise, it might cause panics later on if a
+    /// thread pool is expected to be set up correctly.
+    ///
+    /// See [`enter`](Self::enter) for more details.
+    pub fn enter_sequential<T>(&self, f: impl FnOnce(&CompilerRef<'_>) -> T) -> T {
+        self.0.sess.enter_sequential(|| f(CompilerRef::new(&self.0)))
+    }
+
+    /// Enters the compiler context with mutable access.
+    ///
+    /// Note that this does not set up the rayon thread pool. This is only useful when parsing
+    /// sequentially, like manually using `Parser`. Otherwise, it might cause panics later on if a
+    /// thread pool is expected to be set up correctly.
+    ///
+    /// See [`enter_mut`](Self::enter_mut) for more details.
+    pub fn enter_sequential_mut<T>(&mut self, f: impl FnOnce(&mut CompilerRef<'_>) -> T) -> T {
+        // SAFETY: `sess` is not modified.
+        let sess = unsafe { trustme::decouple_lt(&self.0.sess) };
+        sess.enter_sequential(|| f(self.as_mut()))
     }
 
     fn as_mut(&mut self) -> &mut CompilerRef<'_> {
@@ -146,6 +187,12 @@ pub struct CompilerRef<'c> {
     inner: CompilerInner<'c>,
 }
 
+impl fmt::Debug for CompilerRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.debug_fmt("CompilerRef", f)
+    }
+}
+
 impl<'c> CompilerRef<'c> {
     #[inline]
     fn new<'a>(inner: &'a CompilerInner<'c>) -> &'a Self {
@@ -165,16 +212,34 @@ impl<'c> CompilerRef<'c> {
         self.gcx().sess
     }
 
+    /// Returns a mutable reference to the compiler session.
+    #[inline]
+    pub fn sess_mut(&mut self) -> &mut Session {
+        &mut self.inner.sess
+    }
+
     /// Returns a reference to the diagnostics context.
     #[inline]
-    pub fn dcx(&self) -> &DiagCtxt {
+    pub fn dcx(&self) -> &'c DiagCtxt {
         &self.sess().dcx
     }
 
     /// Returns a mutable reference to the diagnostics context.
     #[inline]
     pub fn dcx_mut(&mut self) -> &mut DiagCtxt {
-        &mut self.inner.sess.dcx
+        &mut self.sess_mut().dcx
+    }
+
+    /// Returns a reference to the sources.
+    #[inline]
+    pub fn sources(&self) -> &'c Sources<'c> {
+        &self.gcx().sources
+    }
+
+    /// Returns a mutable reference to the sources.
+    #[inline]
+    pub fn sources_mut(&mut self) -> &mut Sources<'c> {
+        &mut self.gcx_mut().get_mut().sources
     }
 
     /// Returns a reference to the global context.
@@ -226,6 +291,10 @@ impl<'c> CompilerRef<'c> {
     pub fn analysis(&self) -> Result<ControlFlow<()>> {
         crate::analysis(self.gcx())
     }
+
+    fn debug_fmt(&self, name: &str, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct(name).field("gcx", &self.gcx()).finish_non_exhaustive()
+    }
 }
 
 fn log_ast_arenas_stats(arenas: &mut ThreadLocal<solar_ast::Arena>) {
@@ -238,6 +307,7 @@ fn log_ast_arenas_stats(arenas: &mut ThreadLocal<solar_ast::Arena>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn parse_multiple_times() {
@@ -254,7 +324,7 @@ mod tests {
         compiler.enter_mut(|c| {
             let mut pcx = c.parse();
             pcx.add_file(
-                c.sess().source_map().new_source_file(String::from("test.sol"), "").unwrap(),
+                c.sess().source_map().new_source_file(PathBuf::from("test.sol"), "").unwrap(),
             );
             pcx.parse();
         });
@@ -264,7 +334,7 @@ mod tests {
         compiler.enter_mut(|c| {
             let mut pcx = c.parse();
             pcx.add_file(
-                c.sess().source_map().new_source_file(String::from("test2.sol"), "").unwrap(),
+                c.sess().source_map().new_source_file(PathBuf::from("test2.sol"), "").unwrap(),
             );
             pcx.parse();
         });
@@ -297,7 +367,7 @@ mod tests {
 
     fn parse_dummy_file(c: &mut CompilerRef<'_>) {
         let mut pcx = c.parse();
-        pcx.add_file(c.sess().source_map().new_source_file(String::from("test.sol"), "").unwrap());
+        pcx.add_file(c.sess().source_map().new_source_file(PathBuf::from("test.sol"), "").unwrap());
         pcx.parse();
     }
 
@@ -333,5 +403,14 @@ mod tests {
             parse_dummy_file(c);
             parse_dummy_file(c);
         });
+    }
+
+    #[test]
+    fn replace_session() {
+        let mut compiler = Compiler::new(Session::builder().with_test_emitter().build());
+        compiler.dcx().err("test").emit();
+        assert!(compiler.sess().dcx.has_errors().is_err());
+        *compiler.sess_mut() = Session::builder().with_test_emitter().build();
+        assert!(compiler.sess().dcx.has_errors().is_ok());
     }
 }

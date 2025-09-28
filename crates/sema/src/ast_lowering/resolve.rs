@@ -78,60 +78,40 @@ impl super::LoweringContext<'_> {
                     ast::ImportItems::Aliases(ref aliases) => {
                         for &(import, alias) in aliases.iter() {
                             let name = alias.unwrap_or(import);
-                            if let Some(import_scope) = import_scope {
-                                Self::perform_alias_import(
-                                    self.sess,
-                                    &self.hir,
-                                    source,
-                                    source_scope,
-                                    name,
-                                    import,
-                                    import_scope.resolve(import),
-                                )
+                            let slot;
+                            let resolved = if let Some(import_scope) = import_scope {
+                                import_scope.resolve(import)
                             } else {
-                                Self::perform_alias_import(
+                                slot = source_scope.resolve_cloned(import);
+                                slot.as_deref()
+                            };
+                            if let Some(resolved) = resolved {
+                                debug_assert!(!resolved.is_empty());
+                                for mut decl in resolved.iter().copied() {
+                                    // Re-span to the import name.
+                                    decl.span = name.span;
+                                    let _ =
+                                        source_scope.declare(self.sess, &self.hir, name.name, decl);
+                                }
+                            } else {
+                                let msg = format!(
+                                    "declaration `{import}` not found in {}",
+                                    self.sess
+                                        .source_map()
+                                        .filename_for_diagnostics(&source.file.name)
+                                );
+                                let guar = self.sess.dcx.err(msg).span(import.span).emit();
+                                let _ = source_scope.declare_res(
                                     self.sess,
                                     &self.hir,
-                                    source,
-                                    source_scope,
                                     name,
-                                    import,
-                                    source_scope.resolve_cloned(import),
-                                )
+                                    Res::Err(guar),
+                                );
                             }
                         }
                     }
                 }
             }
-        }
-    }
-
-    /// Separate function to avoid cloning `resolved` when the import is not a self-import.
-    fn perform_alias_import(
-        sess: &Session,
-        hir: &hir::Hir<'_>,
-        source: &hir::Source<'_>,
-        source_scope: &mut Declarations,
-        name: Ident,
-        import: Ident,
-        resolved: Option<impl AsRef<[Declaration]>>,
-    ) {
-        if let Some(resolved) = resolved {
-            let resolved = resolved.as_ref();
-            debug_assert!(!resolved.is_empty());
-            for decl in resolved {
-                // Re-span to the import name.
-                let mut decl = *decl;
-                decl.span = name.span;
-                let _ = source_scope.declare(sess, hir, name.name, decl);
-            }
-        } else {
-            let msg = format!(
-                "declaration `{import}` not found in {}",
-                sess.source_map().filename_for_diagnostics(&source.file.name)
-            );
-            let guar = sess.dcx.err(msg).span(import.span).emit();
-            let _ = source_scope.declare_res(sess, hir, name, Res::Err(guar));
         }
     }
 
@@ -443,6 +423,10 @@ impl<'gcx> ResolveContext<'gcx> {
             );
             let contract = self.hir.contract(c_id);
 
+            if contract.linearization_failed() {
+                continue;
+            }
+
             let len = contract.linearized_bases.len() - 1;
             let base_args: &mut [Option<&'gcx hir::Modifier<'gcx>>] =
                 self.arena.alloc_from_iter(std::iter::repeat_n(None, len));
@@ -546,7 +530,7 @@ impl<'gcx> ResolveContext<'gcx> {
         let ast::ItemKind::Variable(ast_var) = &ast_item.kind else { unreachable!() };
         let span = ast_var.span;
 
-        // https://github.com/ethereum/solidity/blob/9d7cc42bc1c12bb43e9dccf8c6c36833fdfcbbca/libsolidity/ast/Types.cpp#L2852
+        // https://github.com/argotorg/solidity/blob/9d7cc42bc1c12bb43e9dccf8c6c36833fdfcbbca/libsolidity/ast/Types.cpp#L2852
         let mut ret_ty = &self.hir.variable(gettee).ty;
         let mut ret_name = None;
         let mut parameters = SmallVec::<[_; 8]>::new();
@@ -1013,6 +997,7 @@ impl<'gcx> ResolveContext<'gcx> {
                 hir::ExprKind::Binary(self.lower_expr(lhs), *op, self.lower_expr(rhs))
             }
             ast::ExprKind::Call(callee, args) => {
+                let callee = callee.peel_parens();
                 let (callee, options) =
                     if let ast::ExprKind::CallOptions(expr, options) = &callee.kind {
                         (self.lower_expr(expr), Some(self.lower_named_args(options)))
@@ -1503,7 +1488,7 @@ impl Declarations {
             return None;
         }
 
-        // https://github.com/ethereum/solidity/blob/de1a017ccb935d149ed6bcbdb730d89883f8ce02/libsolidity/analysis/DeclarationContainer.cpp#L35
+        // https://github.com/argotorg/solidity/blob/de1a017ccb935d149ed6bcbdb730d89883f8ce02/libsolidity/analysis/DeclarationContainer.cpp#L35
         if matches!(decl.res, Item(Function(_) | Event(_))) {
             let mut getter = None;
             if let Item(Function(id)) = decl.res {

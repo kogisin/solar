@@ -1,9 +1,13 @@
 use crate::{
-    ColorChoice, SessionGlobals, SourceMap,
+    ByteSymbol, ColorChoice, SessionGlobals, SourceMap, Symbol,
     diagnostics::{DiagCtxt, EmittedDiagnostics},
 };
 use solar_config::{CompilerOutput, CompilerStage, Opts, SINGLE_THREADED_TARGET, UnstableOpts};
-use std::{path::Path, sync::Arc};
+use std::{
+    fmt,
+    path::Path,
+    sync::{Arc, OnceLock},
+};
 
 /// Information about the current compiler session.
 pub struct Session {
@@ -13,7 +17,25 @@ pub struct Session {
     /// The diagnostics context.
     pub dcx: DiagCtxt,
     /// The globals.
-    globals: SessionGlobals,
+    globals: Arc<SessionGlobals>,
+    /// The rayon thread pool. This is spawned lazily on first use, rather than always constructing
+    /// one with `SessionBuilder`.
+    thread_pool: OnceLock<rayon::ThreadPool>,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new(Opts::default())
+    }
+}
+
+impl fmt::Debug for Session {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Session")
+            .field("opts", &self.opts)
+            .field("dcx", &self.dcx)
+            .finish_non_exhaustive()
+    }
 }
 
 /// [`Session`] builder.
@@ -26,7 +48,9 @@ pub struct SessionBuilder {
 }
 
 impl SessionBuilder {
-    /// Sets the diagnostic context. This is required.
+    /// Sets the diagnostic context.
+    ///
+    /// If `opts` is set this will default to [`DiagCtxt::from_opts`], otherwise this is required.
     ///
     /// See also the `with_*_emitter*` methods.
     pub fn dcx(mut self, dcx: DiagCtxt) -> Self {
@@ -120,9 +144,14 @@ impl SessionBuilder {
     /// - the source map in the diagnostics context does not match the one set in the builder
     #[track_caller]
     pub fn build(mut self) -> Session {
-        let mut dcx = self.dcx.take().unwrap_or_else(|| panic!("diagnostics context not set"));
-        Session {
-            globals: match self.globals.take() {
+        let opts = self.opts.take();
+        let mut dcx = self.dcx.take().unwrap_or_else(|| {
+            opts.as_ref()
+                .map(DiagCtxt::from_opts)
+                .unwrap_or_else(|| panic!("either diagnostics context or options must be set"))
+        });
+        let sess = Session {
+            globals: Arc::new(match self.globals.take() {
                 Some(globals) => {
                     // Check that the source map matches the one in the diagnostics context.
                     if let Some(sm) = dcx.source_map_mut() {
@@ -138,28 +167,29 @@ impl SessionBuilder {
                     let sm = dcx.source_map_mut().cloned().unwrap_or_default();
                     SessionGlobals::new(sm)
                 }
-            },
+            }),
             dcx,
-            opts: self.opts.take().unwrap_or_default(),
-        }
+            opts: opts.unwrap_or_default(),
+            thread_pool: OnceLock::new(),
+        };
+        sess.reconfigure();
+        debug!(version = %solar_config::version::SEMVER_VERSION, "created new session");
+        sess
     }
 }
 
 impl Session {
-    /// Creates a new session with the given diagnostics context and source map.
-    pub fn new(dcx: DiagCtxt, source_map: Arc<SourceMap>) -> Self {
-        Self::builder().dcx(dcx).source_map(source_map).build()
-    }
-
-    /// Creates a new session with the given diagnostics context and an empty source map.
-    pub fn empty(dcx: DiagCtxt) -> Self {
-        Self::builder().dcx(dcx).build()
-    }
-
     /// Creates a new session builder.
     #[inline]
     pub fn builder() -> SessionBuilder {
         SessionBuilder::default()
+    }
+
+    /// Creates a new session from the given options.
+    ///
+    /// See [`builder`](Self::builder) for a more flexible way to create a session.
+    pub fn new(opts: Opts) -> Self {
+        Self::builder().opts(opts).build()
     }
 
     /// Infers the language from the input files.
@@ -176,6 +206,26 @@ impl Session {
         let mut result = Ok(());
         result = result.and(self.check_unique("emit", &self.opts.emit));
         result
+    }
+
+    /// Reconfigures inner state to match any new options.
+    ///
+    /// Call this after updating options.
+    pub fn reconfigure(&self) {
+        'bp: {
+            let new_base_path = if self.opts.unstable.ui_testing {
+                // `ui_test` relies on absolute paths.
+                None
+            } else if let Some(base_path) =
+                self.opts.base_path.clone().or_else(|| std::env::current_dir().ok())
+                && let Ok(base_path) = self.source_map().file_loader().canonicalize_path(&base_path)
+            {
+                Some(base_path)
+            } else {
+                break 'bp;
+            };
+            self.source_map().set_base_path(new_base_path);
+        }
     }
 
     fn check_unique<T: Eq + std::hash::Hash + std::fmt::Display>(
@@ -198,6 +248,30 @@ impl Session {
     #[inline]
     pub fn unstable(&self) -> &UnstableOpts {
         &self.opts.unstable
+    }
+
+    /// Returns the emitted diagnostics as a result. Can be empty.
+    ///
+    /// Returns `None` if the underlying emitter is not a human buffer emitter created with
+    /// [`with_buffer_emitter`](SessionBuilder::with_buffer_emitter).
+    ///
+    /// Results `Ok` if there are no errors, `Err` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// Print diagnostics to `stdout` if there are no errors, otherwise propagate with `?`:
+    ///
+    /// ```no_run
+    /// # fn f(dcx: solar_interface::diagnostics::DiagCtxt) -> Result<(), Box<dyn std::error::Error>> {
+    /// println!("{}", dcx.emitted_diagnostics_result().unwrap()?);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn emitted_diagnostics_result(
+        &self,
+    ) -> Option<Result<EmittedDiagnostics, EmittedDiagnostics>> {
+        self.dcx.emitted_diagnostics_result()
     }
 
     /// Returns the emitted diagnostics. Can be empty.
@@ -302,11 +376,10 @@ impl Session {
         solar_data_structures::sync::scope(self.is_parallel(), op)
     }
 
-    /// Sets up a thread pool and the session globals in the current thread, then executes the given
-    /// closure.
+    /// Sets up the session globals and executes the given closure in the thread pool.
     ///
-    /// The globals are stored in this [`Session`] itself, meaning multiple consecutive calls to
-    /// [`enter`](Self::enter) will share the same globals.
+    /// The thread pool and globals are stored in this [`Session`] itself, meaning multiple
+    /// consecutive calls to [`enter`](Self::enter) will share the same globals and resources.
     #[track_caller]
     pub fn enter<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
         if in_rayon() {
@@ -316,28 +389,16 @@ impl Session {
                 return self.enter_sequential(f);
             }
             // Avoid creating a new thread pool if it's already set up with the same globals.
-            if self.is_set() {
+            if self.is_entered() {
                 // No need to set again.
                 return f();
             }
         }
 
-        self.enter_sequential(|| {
-            match thread_pool_builder(self).build_scoped(
-                // Initialize each new worker thread when created.
-                // Note that this is not called on the current thread, so `SessionGlobals::set`
-                // can't panic.
-                thread_wrapper(self),
-                // Run `f` on the first thread in the thread pool.
-                move |pool| pool.install(f),
-            ) {
-                Ok(r) => r,
-                Err(e) => handle_thread_pool_build_error(self, e),
-            }
-        })
+        self.enter_sequential(|| self.thread_pool().install(f))
     }
 
-    /// Sets up the session globals in the current thread, then executes the given closure.
+    /// Sets up the session globals and executes the given closure in the current thread.
     ///
     /// Note that this does not set up the rayon thread pool. This is only useful when parsing
     /// sequentially, like manually using `Parser`. Otherwise, it might cause panics later on if a
@@ -350,9 +411,92 @@ impl Session {
         self.globals.set(f)
     }
 
-    /// Returns `true` if the session globals are already set to this instance's.
-    fn is_set(&self) -> bool {
+    /// Interns a string in this session's symbol interner.
+    ///
+    /// The symbol may not be usable on its own if the session has not been [entered](Self::enter).
+    #[inline]
+    #[cfg_attr(debug_assertions, track_caller)]
+    pub fn intern(&self, s: &str) -> Symbol {
+        self.globals.symbol_interner.intern(s)
+    }
+
+    /// Resolves a symbol to its string representation.
+    ///
+    /// The given symbol must have been interned in this session.
+    #[inline]
+    #[cfg_attr(debug_assertions, track_caller)]
+    pub fn resolve_symbol(&self, s: Symbol) -> &str {
+        self.globals.symbol_interner.get(s)
+    }
+
+    /// Interns a byte string in this session's symbol interner.
+    ///
+    /// The symbol may not be usable on its own if the session has not been [entered](Self::enter).
+    #[inline]
+    #[cfg_attr(debug_assertions, track_caller)]
+    pub fn intern_byte_str(&self, s: &[u8]) -> ByteSymbol {
+        self.globals.symbol_interner.intern_byte_str(s)
+    }
+
+    /// Resolves a byte symbol to its string representation.
+    ///
+    /// The given symbol must have been interned in this session.
+    #[inline]
+    #[cfg_attr(debug_assertions, track_caller)]
+    pub fn resolve_byte_str(&self, s: ByteSymbol) -> &[u8] {
+        self.globals.symbol_interner.get_byte_str(s)
+    }
+
+    /// Returns `true` if this session has been entered.
+    pub fn is_entered(&self) -> bool {
         SessionGlobals::try_with(|g| g.is_some_and(|g| g.maybe_eq(&self.globals)))
+    }
+
+    fn thread_pool(&self) -> &rayon::ThreadPool {
+        self.thread_pool.get_or_init(|| {
+            trace!(threads = self.threads(), "building rayon thread pool");
+            self.thread_pool_builder()
+                .spawn_handler(|thread| {
+                    let mut builder = std::thread::Builder::new();
+                    if let Some(name) = thread.name() {
+                        builder = builder.name(name.to_string());
+                    }
+                    if let Some(size) = thread.stack_size() {
+                        builder = builder.stack_size(size);
+                    }
+                    let globals = self.globals.clone();
+                    builder.spawn(move || globals.set(|| thread.run()))?;
+                    Ok(())
+                })
+                .build()
+                .unwrap_or_else(|e| self.handle_thread_pool_build_error(e))
+        })
+    }
+
+    fn thread_pool_builder(&self) -> rayon::ThreadPoolBuilder {
+        let threads = self.threads();
+        debug_assert!(threads > 0, "number of threads must already be resolved");
+        let mut builder = rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("solar-{i}"))
+            .num_threads(threads);
+        // We still want to use a rayon thread pool with 1 thread so that `ParallelIterator`s don't
+        // install and run in the default global thread pool.
+        if threads == 1 {
+            builder = builder.use_current_thread();
+        }
+        builder
+    }
+
+    #[cold]
+    fn handle_thread_pool_build_error(&self, e: rayon::ThreadPoolBuildError) -> ! {
+        let mut err = self.dcx.fatal(format!("failed to build the rayon thread pool: {e}"));
+        if self.is_parallel() {
+            if SINGLE_THREADED_TARGET {
+                err = err.note("the current target might not support multi-threaded execution");
+            }
+            err = err.help("try running with `--threads 1` / `-j1` to disable parallelism");
+        }
+        err.emit()
     }
 }
 
@@ -361,35 +505,6 @@ fn reentrant_log() {
         "running in the current thread's rayon thread pool; \
          this could cause panics later on if it was created without setting the session globals!"
     );
-}
-
-fn thread_pool_builder(sess: &Session) -> rayon::ThreadPoolBuilder {
-    let threads = sess.threads();
-    debug_assert!(threads > 0, "number of threads must already be resolved");
-    let mut builder =
-        rayon::ThreadPoolBuilder::new().thread_name(|i| format!("solar-{i}")).num_threads(threads);
-    // We still want to use a rayon thread pool with 1 thread so that `ParallelIterator`s don't
-    // install and run in the default global thread pool.
-    if threads == 1 {
-        builder = builder.use_current_thread();
-    }
-    builder
-}
-
-fn thread_wrapper(sess: &Session) -> impl Fn(rayon::ThreadBuilder) {
-    move |thread| sess.enter_sequential(|| thread.run())
-}
-
-#[cold]
-fn handle_thread_pool_build_error(sess: &Session, e: rayon::ThreadPoolBuildError) -> ! {
-    let mut err = sess.dcx.fatal(format!("failed to build the rayon thread pool: {e}"));
-    if sess.is_parallel() {
-        if SINGLE_THREADED_TARGET {
-            err = err.note("the current target might not support multi-threaded execution");
-        }
-        err = err.help("try running with `--threads 1` / `-j1` to disable parallelism");
-    }
-    err.emit()
 }
 
 #[inline]
@@ -444,9 +559,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic = "diagnostics context not set"]
-    fn no_dcx() {
-        Session::builder().build();
+    fn builder() {
+        let _ = Session::builder().with_stderr_emitter().build();
+    }
+
+    #[test]
+    fn not_builder() {
+        let _ = Session::new(Opts::default());
+        let _ = Session::default();
     }
 
     #[test]
@@ -459,23 +579,16 @@ mod tests {
     }
 
     #[test]
-    #[should_panic = "session source map does not match the one in the diagnostics context"]
-    fn sm_mismatch_non_builder() {
-        let sm1 = Arc::<SourceMap>::default();
-        let sm2 = Arc::<SourceMap>::default();
-        assert!(!Arc::ptr_eq(&sm1, &sm2));
-        Session::new(DiagCtxt::with_stderr_emitter(Some(sm2)), sm1);
+    #[should_panic = "either diagnostics context or options must be set"]
+    fn no_dcx() {
+        Session::builder().build();
     }
 
     #[test]
-    fn builder() {
-        let _ = Session::builder().with_stderr_emitter().build();
-    }
-
-    #[test]
-    fn empty() {
-        let _ = Session::empty(DiagCtxt::with_stderr_emitter(None));
-        let _ = Session::empty(DiagCtxt::with_stderr_emitter(Some(Default::default())));
+    fn dcx() {
+        let _ = Session::builder().dcx(DiagCtxt::with_stderr_emitter(None)).build();
+        let _ =
+            Session::builder().dcx(DiagCtxt::with_stderr_emitter(Some(Default::default()))).build();
     }
 
     #[test]

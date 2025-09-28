@@ -111,7 +111,7 @@ impl<'sess, 'ast> Parser<'sess, 'ast> {
 
     /// Returns `true` if the current token is the start of a variable declaration.
     pub(super) fn is_variable_declaration(&self) -> bool {
-        // https://github.com/ethereum/solidity/blob/194b114664c7daebc2ff68af3c573272f5d28913/libsolidity/parsing/Parser.cpp#L2451
+        // https://github.com/argotorg/solidity/blob/194b114664c7daebc2ff68af3c573272f5d28913/libsolidity/parsing/Parser.cpp#L2451
         self.token.is_non_reserved_ident(false) || self.is_non_custom_variable_declaration()
     }
 
@@ -129,7 +129,7 @@ impl<'sess, 'ast> Parser<'sess, 'ast> {
     ///
     /// Expects the current token to be a function-like keyword.
     fn parse_function(&mut self) -> PResult<'sess, ItemFunction<'ast>> {
-        let Token { span: lo, kind: TokenKind::Ident(kw) } = self.token else {
+        let TokenRepr { span: lo, kind: TokenKind::Ident(kw) } = *self.token else {
             unreachable!("parse_function called without function-like keyword");
         };
         self.bump(); // kw
@@ -224,7 +224,7 @@ impl<'sess, 'ast> Parser<'sess, 'ast> {
                     self.dcx()
                         .err(msg)
                         .span(span)
-                        .span_note(prev.span, "previous definition")
+                        .span_label(prev.span, "previous definition")
                         .emit();
                 } else {
                     let mut v = Some(visibility);
@@ -243,7 +243,7 @@ impl<'sess, 'ast> Parser<'sess, 'ast> {
                     self.dcx()
                         .err(msg)
                         .span(span)
-                        .span_note(prev.span, "previous definition")
+                        .span_label(prev.span, "previous definition")
                         .emit();
                 } else {
                     let mut sm = Some(state_mutability);
@@ -263,7 +263,7 @@ impl<'sess, 'ast> Parser<'sess, 'ast> {
                     self.dcx().err(msg).span(span).emit();
                 } else if let Some(prev) = header.virtual_ {
                     let msg = "virtual already specified";
-                    self.dcx().err(msg).span(span).span_note(prev, "previous definition").emit();
+                    self.dcx().err(msg).span(span).span_label(prev, "previous definition").emit();
                 } else {
                     header.virtual_ = Some(span);
                 }
@@ -278,7 +278,7 @@ impl<'sess, 'ast> Parser<'sess, 'ast> {
                     self.dcx()
                         .err(msg)
                         .span(span)
-                        .span_note(prev.span, "previous definition")
+                        .span_label(prev.span, "previous definition")
                         .emit();
                 } else {
                     header.override_ = Some(o);
@@ -366,7 +366,7 @@ impl<'sess, 'ast> Parser<'sess, 'ast> {
                     self.dcx()
                         .err(msg)
                         .span(span(new_bases))
-                        .span_note(span(prev), "previous definition")
+                        .span_label(span(prev), "previous definition")
                         .emit();
                 } else if !new_bases.is_empty() {
                     bases = Some(new_bases);
@@ -378,7 +378,7 @@ impl<'sess, 'ast> Parser<'sess, 'ast> {
                     self.dcx()
                         .err(msg)
                         .span(new_layout.span)
-                        .span_note(prev.span, "previous definition")
+                        .span_label(prev.span, "previous definition")
                         .emit();
                 } else {
                     layout = Some(new_layout);
@@ -486,7 +486,7 @@ impl<'sess, 'ast> Parser<'sess, 'ast> {
     fn parse_semver_req_components_dis(
         &mut self,
     ) -> PResult<'sess, Box<'ast, [SemverReqCon<'ast>]>> {
-        // https://github.com/ethereum/solidity/blob/e81f2bdbd66e9c8780f74b8a8d67b4dc2c87945e/liblangutil/SemVerHandler.cpp#L170
+        // https://github.com/argotorg/solidity/blob/e81f2bdbd66e9c8780f74b8a8d67b4dc2c87945e/liblangutil/SemVerHandler.cpp#L170
         let mut dis = Vec::new();
         loop {
             dis.push(self.parse_semver_req_components_con()?);
@@ -524,7 +524,7 @@ impl<'sess, 'ast> Parser<'sess, 'ast> {
         let (op, v) = self.parse_semver_component()?;
         if self.eat(TokenKind::BinOp(BinOpToken::Minus)) {
             // range
-            // Ops are parsed and overwritten: https://github.com/ethereum/solidity/blob/e81f2bdbd66e9c8780f74b8a8d67b4dc2c87945e/liblangutil/SemVerHandler.cpp#L210
+            // Ops are parsed and overwritten: https://github.com/argotorg/solidity/blob/e81f2bdbd66e9c8780f74b8a8d67b4dc2c87945e/liblangutil/SemVerHandler.cpp#L210
             let _ = op;
             let (_second_op, right) = self.parse_semver_component()?;
             let kind = SemverReqComponentKind::Range(v, right);
@@ -554,7 +554,7 @@ impl<'sess, 'ast> Parser<'sess, 'ast> {
     }
 
     fn parse_semver_op(&mut self) -> Option<SemverOp> {
-        // https://github.com/ethereum/solidity/blob/e81f2bdbd66e9c8780f74b8a8d67b4dc2c87945e/liblangutil/SemVerHandler.cpp#L227
+        // https://github.com/argotorg/solidity/blob/e81f2bdbd66e9c8780f74b8a8d67b4dc2c87945e/liblangutil/SemVerHandler.cpp#L227
         let op = match self.token.kind {
             TokenKind::Eq => SemverOp::Exact,
             TokenKind::Gt => SemverOp::Greater,
@@ -930,7 +930,8 @@ impl<'sess, 'ast> Parser<'sess, 'ast> {
         if !self.check_str_lit() {
             return None;
         }
-        let Token { kind: TokenKind::Literal(TokenLitKind::Str, symbol), span } = self.token else {
+        let TokenRepr { kind: TokenKind::Literal(TokenLitKind::Str, symbol), span } = *self.token
+        else {
             unreachable!()
         };
         self.bump();
@@ -1385,8 +1386,12 @@ mod tests {
     use super::*;
     use solar_interface::{Result, Session, source_map::FileName};
 
+    fn session() -> Session {
+        Session::builder().with_test_emitter().single_threaded().build()
+    }
+
     fn assert_version_matches(tests: &[(&str, &str, bool)]) {
-        let sess = Session::builder().with_test_emitter().build();
+        let sess = session();
         sess.enter(|| -> Result {
             for (i, &(v, req_s, res)) in tests.iter().enumerate() {
                 let name = i.to_string();
@@ -1608,7 +1613,7 @@ mod tests {
         ];
 
         for (idx, src) in test_functions.iter().enumerate() {
-            let sess = Session::builder().with_test_emitter().build();
+            let sess = session();
             sess.enter(|| -> Result {
                 let arena = Arena::new();
                 let mut parser = Parser::from_source_code(
@@ -1703,7 +1708,7 @@ mod tests {
             ),
         ];
 
-        let sess = Session::builder().with_test_emitter().build();
+        let sess = session();
         sess.enter(|| -> Result {
             for (idx, (src, vis, sm, virt, params, returns)) in test_cases.iter().enumerate() {
                 let arena = Arena::new();

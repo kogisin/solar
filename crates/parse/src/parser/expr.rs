@@ -6,7 +6,7 @@ impl<'sess, 'ast> Parser<'sess, 'ast> {
     /// Parses an expression.
     #[inline]
     pub fn parse_expr(&mut self) -> PResult<'sess, Box<'ast, Expr<'ast>>> {
-        self.parse_expr_with(None)
+        self.with_recursion_limit("expression", |this| this.parse_expr_with(None))
     }
 
     #[instrument(name = "parse_expr", level = "trace", skip_all)]
@@ -283,7 +283,7 @@ impl<'sess, 'ast> Parser<'sess, 'ast> {
 }
 
 fn token_precedence(t: Token) -> usize {
-    // https://github.com/ethereum/solidity/blob/78ec8dd6f93bf5a5b4ca7582f9d491a4f66c3610/liblangutil/Token.h#L68
+    // https://github.com/argotorg/solidity/blob/78ec8dd6f93bf5a5b4ca7582f9d491a4f66c3610/liblangutil/Token.h#L68
     use BinOpToken::*;
     use TokenKind::*;
     match t.kind {

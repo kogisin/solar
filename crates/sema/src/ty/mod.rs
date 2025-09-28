@@ -1,8 +1,8 @@
 use crate::{
-    Sources, ast,
+    Source, Sources, ast,
     ast_lowering::SymbolResolver,
     builtins::{Builtin, members},
-    hir::{self, Hir},
+    hir::{self, Hir, SourceId},
 };
 use alloy_primitives::{B256, Selector, U256, keccak256};
 use either::Either;
@@ -18,12 +18,16 @@ use solar_interface::{
     Ident, Session, Span,
     config::CompilerStage,
     diagnostics::{DiagCtxt, ErrorGuaranteed},
+    source_map::{FileName, SourceFile},
 };
 use std::{
     fmt,
     hash::Hash,
     ops::ControlFlow,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use thread_local::ThreadLocal;
 
@@ -139,6 +143,12 @@ impl<'gcx> std::ops::Deref for Gcx<'gcx> {
     }
 }
 
+impl<'gcx> fmt::Debug for Gcx<'gcx> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Transparent wrapper around `&'gcx mut GlobalCtxt<'gcx>`.
 ///
 /// This uses a raw pointer because using `&mut` directly would make `'gcx` covariant and this just
@@ -219,6 +229,16 @@ pub struct GlobalCtxt<'gcx> {
     cache: Cache<'gcx>,
 }
 
+impl fmt::Debug for GlobalCtxt<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GlobalCtxt")
+            .field("stage", &self.stage.get())
+            .field("sess", self.sess)
+            .field("sources", &self.sources.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'gcx> GlobalCtxt<'gcx> {
     pub(crate) fn new(sess: &'gcx Session) -> Self {
         let interner = Interner::new();
@@ -249,14 +269,20 @@ impl<'gcx> Gcx<'gcx> {
         Self(gcx)
     }
 
+    /// Returns the current compiler stage.
+    pub fn stage(&self) -> Option<CompilerStage> {
+        self.stage.get()
+    }
+
     pub(crate) fn advance_stage(&self, to: CompilerStage) -> ControlFlow<()> {
+        let from = self.stage();
         let result = self.advance_stage_(to);
-        trace!(from=?self.stage.get(), ?to, ?result, "advance stage");
+        trace!(?from, ?to, ?result, "advance stage");
         result
     }
 
     fn advance_stage_(&self, to: CompilerStage) -> ControlFlow<()> {
-        let current = self.stage.get();
+        let current = self.stage();
 
         // Special case: allow calling `parse` multiple times while currently parsing.
         if to == CompilerStage::Parsing && current == Some(to) {
@@ -370,6 +396,29 @@ impl<'gcx> Gcx<'gcx> {
 
     pub fn mk_ty_err(self, guar: ErrorGuaranteed) -> Ty<'gcx> {
         Ty::new(self, TyKind::Err(guar))
+    }
+
+    /// Returns the source file with the given path, if it exists.
+    pub fn get_file(self, name: impl Into<FileName>) -> Option<Arc<SourceFile>> {
+        self.sess.source_map().get_file(name)
+    }
+
+    /// Returns the AST source at the given path, if it exists.
+    pub fn get_ast_source(
+        self,
+        name: impl Into<FileName>,
+    ) -> Option<(SourceId, &'gcx Source<'gcx>)> {
+        let file = self.get_file(name)?;
+        self.sources.get_file(&file)
+    }
+
+    /// Returns the HIR source at the given path, if it exists.
+    pub fn get_hir_source(
+        self,
+        name: impl Into<FileName>,
+    ) -> Option<(SourceId, &'gcx hir::Source<'gcx>)> {
+        let file = self.get_file(name)?;
+        self.hir.sources.iter_enumerated().find(|(_, source)| Arc::ptr_eq(&source.file, &file))
     }
 
     /// Returns the name of the given item.
@@ -610,7 +659,7 @@ cached! {
 ///
 /// This is the XOR of the selectors of all function selectors in the interface.
 ///
-/// The solc implementation excludes inheritance: <https://github.com/ethereum/solidity/blob/ad2644c52b3afbe80801322c5fe44edb59383500/libsolidity/ast/AST.cpp#L310-L316>
+/// The solc implementation excludes inheritance: <https://github.com/argotorg/solidity/blob/ad2644c52b3afbe80801322c5fe44edb59383500/libsolidity/ast/AST.cpp#L310-L316>
 ///
 /// See [ERC-165] for more details.
 ///
@@ -819,7 +868,7 @@ pub fn members_of(gcx: _, ty: Ty<'gcx>) -> members::MemberList<'gcx> {
 fn var_type<'gcx>(gcx: Gcx<'gcx>, var: &'gcx hir::Variable<'gcx>, ty: Ty<'gcx>) -> Ty<'gcx> {
     use hir::DataLocation::*;
 
-    // https://github.com/ethereum/solidity/blob/48d40d5eaf97c835cf55896a7a161eedc57c57f9/libsolidity/ast/AST.cpp#L820
+    // https://github.com/argotorg/solidity/blob/48d40d5eaf97c835cf55896a7a161eedc57c57f9/libsolidity/ast/AST.cpp#L820
     let has_reference_or_mapping_type = ty.is_reference_type() || ty.has_mapping();
     let mut func_vis = None;
     let mut locs;

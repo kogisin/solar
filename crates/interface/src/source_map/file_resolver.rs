@@ -3,15 +3,16 @@
 //! Modified from [`solang`](https://github.com/hyperledger/solang/blob/0f032dcec2c6e96797fd66fa0175a02be0aba71c/src/file_resolver.rs).
 
 use super::SourceFile;
-use crate::SourceMap;
+use crate::{Session, SourceMap};
 use itertools::Itertools;
 use normalize_path::NormalizePath;
 use solar_config::ImportRemapping;
+use solar_data_structures::smallvec::SmallVec;
 use std::{
     borrow::Cow,
     io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 /// An error that occurred while resolving a path.
@@ -38,10 +39,10 @@ pub struct FileResolver<'a> {
     /// Import remappings.
     remappings: Vec<ImportRemapping>,
 
-    /// [`std::env::current_dir`] cache. Unused if the current directory is set manually.
-    env_current_dir: Option<PathBuf>,
     /// Custom current directory.
     custom_current_dir: Option<PathBuf>,
+    /// [`std::env::current_dir`] cache. Unused if the current directory is set manually.
+    env_current_dir: OnceLock<Option<PathBuf>>,
 }
 
 impl<'a> FileResolver<'a> {
@@ -51,11 +52,37 @@ impl<'a> FileResolver<'a> {
             source_map,
             include_paths: Vec::new(),
             remappings: Vec::new(),
-            env_current_dir: std::env::current_dir()
-                .inspect_err(|e| debug!("failed to get current_dir: {e}"))
-                .ok(),
             custom_current_dir: None,
+            env_current_dir: OnceLock::new(),
         }
+    }
+
+    /// Configures the file resolver from a session.
+    pub fn configure_from_sess(&mut self, sess: &Session) {
+        self.add_include_paths(sess.opts.include_paths.iter().cloned());
+        self.add_import_remappings(sess.opts.import_remappings.iter().cloned());
+        'b: {
+            if let Some(base_path) = &sess.opts.base_path {
+                let base_path = if base_path.is_absolute() {
+                    base_path.as_path()
+                } else {
+                    &if let Ok(path) = self.canonicalize_unchecked(base_path) {
+                        path
+                    } else {
+                        break 'b;
+                    }
+                };
+                self.set_current_dir(base_path);
+            }
+        }
+    }
+
+    /// Clears the internal state.
+    pub fn clear(&mut self) {
+        self.include_paths.clear();
+        self.remappings.clear();
+        self.custom_current_dir = None;
+        self.env_current_dir.take();
     }
 
     /// Sets the current directory.
@@ -64,6 +91,7 @@ impl<'a> FileResolver<'a> {
     ///
     /// Panics if `current_dir` is not an absolute path.
     #[track_caller]
+    #[doc(alias = "set_base_path")]
     pub fn set_current_dir(&mut self, current_dir: &Path) {
         if !current_dir.is_absolute() {
             panic!("current_dir must be an absolute path");
@@ -97,29 +125,42 @@ impl<'a> FileResolver<'a> {
     }
 
     /// Returns the current directory, or `.` if it could not be resolved.
+    #[doc(alias = "base_path")]
     pub fn current_dir(&self) -> &Path {
         self.try_current_dir().unwrap_or(Path::new("."))
     }
 
     /// Returns the current directory, if resolved successfully.
+    #[doc(alias = "try_base_path")]
     pub fn try_current_dir(&self) -> Option<&Path> {
-        self.custom_current_dir.as_deref().or(self.env_current_dir.as_deref())
+        self.custom_current_dir.as_deref().or_else(|| self.env_current_dir())
+    }
+
+    fn env_current_dir(&self) -> Option<&Path> {
+        self.env_current_dir
+            .get_or_init(|| {
+                std::env::current_dir()
+                    .inspect_err(|e| debug!("failed to get current_dir: {e}"))
+                    .ok()
+            })
+            .as_deref()
     }
 
     /// Canonicalizes a path using [`Self::current_dir`].
     pub fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
-        self.canonicalize_absolute(&self.make_absolute(path))
+        self.canonicalize_unchecked(&self.make_absolute(path))
     }
 
-    fn canonicalize_absolute(&self, path: &Path) -> io::Result<PathBuf> {
-        debug_assert!(path.is_absolute());
-        crate::canonicalize(path)
+    fn canonicalize_unchecked(&self, path: &Path) -> io::Result<PathBuf> {
+        self.source_map.file_loader().canonicalize_path(path)
     }
 
     /// Normalizes a path removing unnecessary components.
     ///
     /// Does not perform I/O.
     pub fn normalize<'b>(&self, path: &'b Path) -> Cow<'b, Path> {
+        // NOTE: checking `is_normalized` will not produce the correct result since it won't
+        // consider `./` segments. See its documentation.
         Cow::Owned(path.normalize())
     }
 
@@ -174,11 +215,12 @@ impl<'a> FileResolver<'a> {
 
         let original_path = path;
         let path = &*self.remap_path(path, parent);
-        let mut result = Vec::with_capacity(1);
+
+        let mut candidates = SmallVec::<[_; 1]>::new();
         // Quick deduplication when include paths are duplicated.
-        let mut push_file = |file: Arc<SourceFile>| {
-            if !result.iter().any(|f| Arc::ptr_eq(f, &file)) {
-                result.push(file);
+        let mut push_candidate = |file: Arc<SourceFile>| {
+            if !candidates.iter().any(|f| Arc::ptr_eq(f, &file)) {
+                candidates.push(file);
             }
         };
 
@@ -187,27 +229,28 @@ impl<'a> FileResolver<'a> {
         // "By default the base path is empty, which leaves the source unit name unchanged."
         if self.include_paths.is_empty() || path.is_absolute() {
             if let Some(file) = self.try_file(path)? {
-                result.push(file);
+                push_candidate(file);
             }
         } else {
-            // Try all the import paths.
-            for include_path in &self.include_paths {
+            // Try all the include paths.
+            let base_path = self.try_current_dir().into_iter();
+            for include_path in base_path.chain(self.include_paths.iter().map(|p| p.as_path())) {
                 let path = include_path.join(path);
                 if let Some(file) = self.try_file(&path)? {
-                    push_file(file);
+                    push_candidate(file);
                 }
             }
         }
 
-        match result.len() {
+        match candidates.len() {
             0 => Err(ResolveError::NotFound(original_path.into())),
-            1 => Ok(result.pop().unwrap()),
-            _ => Err(ResolveError::MultipleMatches(original_path.into(), result)),
+            1 => Ok(candidates.pop().unwrap()),
+            _ => Err(ResolveError::MultipleMatches(original_path.into(), candidates.into_vec())),
         }
     }
 
     /// Applies the import path mappings to `path`.
-    // Reference: <https://github.com/ethereum/solidity/blob/e202d30db8e7e4211ee973237ecbe485048aae97/libsolidity/interface/ImportRemapper.cpp#L32>
+    // Reference: <https://github.com/argotorg/solidity/blob/e202d30db8e7e4211ee973237ecbe485048aae97/libsolidity/interface/ImportRemapper.cpp#L32>
     pub fn remap_path<'b>(&self, path: &'b Path, parent: Option<&Path>) -> Cow<'b, Path> {
         let remapped = self.remap_path_(path, parent);
         if remapped != path {
@@ -227,15 +270,19 @@ impl<'a> FileResolver<'a> {
             let context = &*sanitize_path(context);
             let prefix = &*sanitize_path(prefix);
 
+            // Skip if current context is closer.
             if context.len() < longest_context {
                 continue;
             }
+            // Skip if current context is not a prefix of the context.
             if !_context.starts_with(context) {
                 continue;
             }
-            if prefix.len() < longest_prefix {
+            // Skip if we already have a closer prefix match.
+            if prefix.len() < longest_prefix && context.len() == longest_context {
                 continue;
             }
+            // Skip if the prefix does not match.
             let Ok(up) = path.strip_prefix(prefix) else {
                 continue;
             };
@@ -269,8 +316,6 @@ impl<'a> FileResolver<'a> {
         }
 
         // Make the path absolute with the current directory.
-        // Normally this is only needed when paths are inserted manually outside of the resolver, as
-        // we always try to strip the prefix of the current directory (see below).
         let apath = &*self.make_absolute(rpath);
         if apath != rpath
             && let Some(file) = self.source_map().get_file(apath)
@@ -280,19 +325,14 @@ impl<'a> FileResolver<'a> {
         }
 
         // Canonicalize, checking symlinks and if it exists.
-        if let Ok(path) = self.canonicalize_absolute(apath) {
-            // Save the file name relative to the current directory.
-            let mut relpath = path.as_path();
-            if let Ok(p) = relpath.strip_prefix(self.current_dir()) {
-                relpath = p;
-            }
-            trace!("canonicalized to {}", relpath.display());
+        if let Ok(path) = self.canonicalize_unchecked(apath) {
             return self
                 .source_map()
-                // Can't use `load_file` with `rel_path` as a custom `current_dir` may be set.
-                .load_file_with_name(relpath.to_path_buf().into(), &path)
+                // Store the file with `apath` as the name instead of `path`.
+                // In case of symlinks we want to reference the symlink path, not the target path.
+                .load_file_with_name(apath.to_path_buf().into(), &path)
                 .map(Some)
-                .map_err(|e| ResolveError::ReadFile(relpath.into(), e));
+                .map_err(|e| ResolveError::ReadFile(path, e));
         }
 
         trace!("not found");

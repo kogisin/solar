@@ -1,16 +1,16 @@
 use crate::{Gcx, hir::SourceId, ty::GcxMut};
 use rayon::prelude::*;
-use solar_ast as ast;
+use solar_ast::{self as ast, Span};
 use solar_data_structures::{
-    index::{Idx, IndexVec},
-    map::FxHashSet,
+    index::{Idx, IndexVec, index_vec},
+    map::{FxHashMap, FxHashSet},
+    sync::Mutex,
 };
 use solar_interface::{
     Result, Session,
     config::CompilerStage,
-    diagnostics::DiagCtxt,
-    pluralize,
-    source_map::{FileName, FileResolver, SourceFile},
+    diagnostics::{DiagCtxt, ErrorGuaranteed},
+    source_map::{FileName, FileResolver, ResolveError, SourceFile},
 };
 use solar_parse::{Lexer, Parser, unescape};
 use std::{fmt, path::Path, sync::Arc};
@@ -53,9 +53,11 @@ impl<'gcx> ParsingContext<'gcx> {
     pub(crate) fn new(mut gcx_: GcxMut<'gcx>) -> Self {
         let gcx = gcx_.get_mut();
         let sess = gcx.sess;
+        let mut file_resolver = FileResolver::new(sess.source_map());
+        file_resolver.configure_from_sess(sess);
         Self {
             sess,
-            file_resolver: FileResolver::new(sess.source_map()),
+            file_resolver,
             sources: &mut gcx.sources,
             arenas: &gcx.ast_arenas,
             resolve_imports: !sess.opts.unstable.no_resolve_imports,
@@ -77,11 +79,31 @@ impl<'gcx> ParsingContext<'gcx> {
         self.resolve_imports = resolve_imports;
     }
 
+    /// Resolves a file.
+    pub fn resolve_file(&self, path: impl AsRef<Path>) -> Result<Arc<SourceFile>> {
+        self.file_resolver.resolve_file(path.as_ref(), None).map_err(self.map_resolve_error())
+    }
+
+    /// Resolves a list of files.
+    pub fn resolve_files(
+        &self,
+        paths: impl IntoIterator<Item = impl AsRef<Path>>,
+    ) -> impl Iterator<Item = Result<Arc<SourceFile>>> {
+        paths.into_iter().map(|path| self.resolve_file(path))
+    }
+
+    /// Resolves a list of files in parallel.
+    pub fn par_resolve_files(
+        &self,
+        paths: impl IntoParallelIterator<Item = impl AsRef<Path>>,
+    ) -> impl ParallelIterator<Item = Result<Arc<SourceFile>>> {
+        paths.into_par_iter().map(|path| self.resolve_file(path))
+    }
+
     /// Loads `stdin` into the context.
     #[instrument(level = "debug", skip_all)]
     pub fn load_stdin(&mut self) -> Result<()> {
-        let file =
-            self.file_resolver.load_stdin().map_err(|e| self.dcx().err(e.to_string()).emit())?;
+        let file = self.file_resolver.load_stdin().map_err(self.map_resolve_error())?;
         self.add_file(file);
         Ok(())
     }
@@ -95,67 +117,130 @@ impl<'gcx> ParsingContext<'gcx> {
         Ok(())
     }
 
+    /// Loads files into the context in parallel.
+    pub fn par_load_files(
+        &mut self,
+        paths: impl IntoParallelIterator<Item = impl AsRef<Path>>,
+    ) -> Result<()> {
+        let resolved = self.par_resolve_files(paths).collect::<Result<Vec<_>>>()?;
+        self.add_files(resolved);
+        Ok(())
+    }
+
     /// Loads a file into the context.
     #[instrument(level = "debug", skip_all)]
     pub fn load_file(&mut self, path: &Path) -> Result<()> {
-        let file = self
-            .file_resolver
-            .resolve_file(path, None)
-            .map_err(|e| self.dcx().err(e.to_string()).emit())?;
+        let file = self.resolve_file(path)?;
         self.add_file(file);
         Ok(())
     }
 
     /// Adds a preloaded file to the resolver.
+    pub fn add_files(&mut self, files: impl IntoIterator<Item = Arc<SourceFile>>) {
+        for file in files {
+            self.add_file(file);
+        }
+    }
+
+    /// Adds a preloaded file to the resolver.
     pub fn add_file(&mut self, file: Arc<SourceFile>) {
-        self.sources.add_file(file);
+        self.sources.get_or_insert_file(file);
+    }
+
+    /// Resolves all the imports of all the loaded sources.
+    pub fn force_resolve_all_imports(mut self) {
+        let mut sources = std::mem::take(self.sources);
+        let mut any_new = false;
+        for id in sources.indices() {
+            let source = &mut sources[id];
+            let ast = source.ast.take();
+            for (import_item_id, import_file) in
+                self.resolve_imports(&source.file.clone(), ast.as_ref())
+            {
+                let (_import_id, is_new) =
+                    sources.add_import(id, import_item_id, import_file, true);
+                if is_new {
+                    any_new = true;
+                }
+            }
+            sources[id].ast = ast;
+        }
+        *self.sources = sources;
+
+        self.parsed = true;
+        if any_new {
+            self.parse_inner();
+        }
     }
 
     /// Parses all the loaded sources, recursing into imports if specified.
     ///
     /// Sources are not guaranteed to be in any particular order, as they may be parsed in parallel.
-    #[instrument(level = "debug", skip_all)]
     pub fn parse(mut self) {
+        self.parse_inner();
+    }
+
+    #[instrument(name = "parse", level = "debug", skip_all)]
+    fn parse_inner(&mut self) {
         self.parsed = true;
         let _ = self.gcx.advance_stage(CompilerStage::Parsing);
+
         let mut sources = std::mem::take(self.sources);
         if !sources.is_empty() {
-            let arenas = self.arenas;
-            if self.sess.is_sequential() {
-                self.parse_sequential(&mut sources, arenas.get_or_default());
+            let dbg = enabled!(tracing::Level::DEBUG);
+            let len_before = sources.len();
+            let sources_parsed_before = if dbg { sources.count_parsed() } else { 0 };
+
+            if self.sess.is_sequential() || (sources.len() == 1 && !self.resolve_imports) {
+                self.parse_sequential(&mut sources, self.arenas.get_or_default());
             } else {
-                self.parse_parallel(&mut sources, arenas);
+                self.parse_parallel(&mut sources, self.arenas);
             }
-            debug!(
-                num_sources = sources.len(),
-                num_contracts = sources.iter().map(|s| s.count_contracts()).sum::<usize>(),
-                total_bytes = %crate::fmt_bytes(sources.iter().map(|s| s.file.src.len()).sum::<usize>()),
-                total_lines = sources.iter().map(|s| s.file.count_lines()).sum::<usize>(),
-                "parsed all sources",
-            );
+
+            if dbg {
+                let len_after = sources.len();
+                let sources_added =
+                    len_after.checked_sub(len_before).expect("parsing removed sources?");
+
+                let sources_parsed_after = sources.count_parsed();
+                let solidity_sources_parsed = sources_parsed_after
+                    .checked_sub(sources_parsed_before)
+                    .expect("parsing removed parsed sources?");
+
+                if sources_added > 0 || solidity_sources_parsed > 0 {
+                    debug!(
+                        sources_added,
+                        solidity_sources_parsed,
+                        num_sources = len_after,
+                        num_contracts = sources.iter().map(|s| s.count_contracts()).sum::<usize>(),
+                        total_bytes = %crate::fmt_bytes(sources.iter().map(|s| s.file.src.len()).sum::<usize>()),
+                        total_lines = sources.iter().map(|s| s.file.count_lines()).sum::<usize>(),
+                        "parsed",
+                    );
+                }
+            }
         }
+
         sources.assert_unique();
         *self.sources = sources;
     }
 
     fn parse_sequential<'ast>(&self, sources: &mut Sources<'ast>, arena: &'ast ast::Arena) {
         for i in 0.. {
-            let current_file = SourceId::from_usize(i);
-            let Some(source) = sources.get(current_file) else { break };
+            let id = SourceId::from_usize(i);
+            let Some(source) = sources.get(id) else { break };
             if source.ast.is_some() {
                 continue;
             }
 
             let ast = self.parse_one(&source.file, arena);
-            let n_sources = sources.len();
-            for (import_item_id, import) in self.resolve_imports(&source.file, ast.as_ref()) {
-                sources.add_import(current_file, import_item_id, import);
+            let _guard = debug_span!("resolve_imports").entered();
+            for (import_item_id, import_file) in
+                self.resolve_imports(&source.file.clone(), ast.as_ref())
+            {
+                sources.add_import(id, import_item_id, import_file, false);
             }
-            let new_files = sources.len() - n_sources;
-            if new_files > 0 {
-                trace!(new_files);
-            }
-            sources[current_file].ast = ast;
+            sources[id].ast = ast;
         }
     }
 
@@ -164,32 +249,57 @@ impl<'gcx> ParsingContext<'gcx> {
         sources: &mut Sources<'ast>,
         arenas: &'ast ThreadLocal<ast::Arena>,
     ) {
-        let mut start = 0;
-        loop {
-            let base = start;
-            let to_parse = &mut sources.raw[start..];
-            if to_parse.is_empty() {
-                break;
+        let lock = Mutex::new(std::mem::take(sources));
+        rayon::scope(|scope| {
+            let sources = &*lock.lock();
+            for (id, source) in sources.iter_enumerated() {
+                if source.ast.is_some() {
+                    continue;
+                }
+                let file = source.file.clone();
+                self.spawn_parse_job(&lock, id, file, arenas, scope);
             }
-            debug!(start, "parsing {} file{}", to_parse.len(), pluralize!(to_parse.len()));
-            start += to_parse.len();
-            let imports = to_parse
-                .par_iter_mut()
-                .enumerate()
-                .filter(|(_, source)| source.ast.is_none())
-                .flat_map_iter(|(i, source)| {
-                    source.ast = self.parse_one(&source.file, arenas.get_or_default());
-                    self.resolve_imports(&source.file, source.ast.as_ref())
-                        .map(move |import| (i, import))
-                })
-                .collect_vec_list();
-            let n_sources = sources.len();
-            for (i, (import_item_id, import)) in imports.into_iter().flatten() {
-                sources.add_import(SourceId::from_usize(base + i), import_item_id, import);
-            }
-            let new_files = sources.len() - n_sources;
-            if new_files > 0 {
-                trace!(new_files);
+        });
+        *sources = lock.into_inner();
+    }
+
+    fn spawn_parse_job<'ast, 'scope>(
+        &'scope self,
+        lock: &'scope Mutex<Sources<'ast>>,
+        id: SourceId,
+        file: Arc<SourceFile>,
+        arenas: &'ast ThreadLocal<ast::Arena>,
+        scope: &rayon::Scope<'scope>,
+    ) {
+        scope.spawn(move |scope| self.parse_job(lock, id, file, arenas, scope));
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    fn parse_job<'ast, 'scope>(
+        &'scope self,
+        lock: &'scope Mutex<Sources<'ast>>,
+        id: SourceId,
+        file: Arc<SourceFile>,
+        arenas: &'ast ThreadLocal<ast::Arena>,
+        scope: &rayon::Scope<'scope>,
+    ) {
+        // Parse and resolve imports.
+        let ast = self.parse_one(&file, arenas.get_or_default());
+        let imports = {
+            let _guard = debug_span!("resolve_imports").entered();
+            self.resolve_imports(&file, ast.as_ref()).collect::<Vec<_>>()
+        };
+
+        // Set AST, add imports and recursively spawn jobs for parsing them if necessary.
+        let _guard = debug_span!("add_imports").entered();
+        let sources = &mut *lock.lock();
+        assert!(sources[id].ast.is_none());
+        sources[id].ast = ast;
+        for (import_item_id, import_file) in imports {
+            let (import_id, is_new) =
+                sources.add_import(id, import_item_id, import_file.clone(), false);
+            if is_new {
+                self.spawn_parse_job(lock, import_id, import_file, arenas, scope);
             }
         }
     }
@@ -213,48 +323,68 @@ impl<'gcx> ParsingContext<'gcx> {
 
     /// Resolves the imports of the given file, returning an iterator over all the imported files
     /// that were successfully resolved.
-    fn resolve_imports<'a, 'b, 'c>(
-        &'a self,
+    fn resolve_imports(
+        &self,
         file: &SourceFile,
-        ast: Option<&'b ast::SourceUnit<'c>>,
-    ) -> impl Iterator<Item = (ast::ItemId, Arc<SourceFile>)> + use<'a, 'b, 'c, 'gcx> {
+        ast: Option<&ast::SourceUnit<'_>>,
+    ) -> impl Iterator<Item = (ast::ItemId, Arc<SourceFile>)> {
         let parent = match &file.name {
-            FileName::Real(path) => Some(path.to_path_buf()),
+            FileName::Real(path) => Some(path.as_path()),
             FileName::Stdin | FileName::Custom(_) => None,
         };
         let items =
             ast.filter(|_| self.resolve_imports).map(|ast| &ast.items[..]).unwrap_or_default();
         items
             .iter_enumerated()
-            .filter_map(|(id, item)| {
-                if let ast::ItemKind::Import(import) = &item.kind {
-                    Some((id, import))
-                } else {
-                    None
-                }
-            })
-            .filter_map(move |(id, import)| {
-                let span = import.path.span;
-                let path_str = import.path.value.as_str();
-                let (path_bytes, any_error) = unescape::parse_string_literal(
-                    path_str,
-                    unescape::StrKind::Str,
-                    span,
-                    self.sess,
-                );
-                if any_error {
-                    return None;
-                }
-                let Some(path) = path_from_bytes(&path_bytes[..]) else {
-                    self.dcx().err("import path is not a valid UTF-8 string").span(span).emit();
-                    return None;
-                };
-                self.file_resolver
-                    .resolve_file(path, parent.as_deref())
-                    .map_err(|e| self.dcx().err(e.to_string()).span(span).emit())
-                    .ok()
-                    .map(|file| (id, file))
-            })
+            .filter_map(move |(id, item)| self.resolve_import(item, parent).map(|file| (id, file)))
+    }
+
+    fn resolve_import(
+        &self,
+        item: &ast::Item<'_>,
+        parent: Option<&Path>,
+    ) -> Option<Arc<SourceFile>> {
+        let ast::ItemKind::Import(import) = &item.kind else { return None };
+        self.resolve_import_directive(import, parent)
+    }
+
+    fn resolve_import_directive(
+        &self,
+        import: &ast::ImportDirective<'_>,
+        parent: Option<&Path>,
+    ) -> Option<Arc<SourceFile>> {
+        let span = import.path.span;
+        let path_str = import.path.value.as_str();
+        let (path_bytes, any_error) =
+            unescape::parse_string_literal(path_str, unescape::StrKind::Str, span, self.sess);
+        if any_error {
+            return None;
+        }
+        let Some(path) = path_from_bytes(&path_bytes[..]) else {
+            self.dcx().err("import path is not a valid UTF-8 string").span(span).emit();
+            return None;
+        };
+        self.file_resolver
+            .resolve_file(path, parent)
+            .map_err(self.map_resolve_error_with(Some(span)))
+            .ok()
+    }
+
+    fn map_resolve_error(&self) -> impl FnOnce(ResolveError) -> ErrorGuaranteed {
+        self.map_resolve_error_with(None)
+    }
+
+    fn map_resolve_error_with(
+        &self,
+        span: Option<Span>,
+    ) -> impl FnOnce(ResolveError) -> ErrorGuaranteed {
+        move |e| {
+            let mut err = self.dcx().err(e.to_string());
+            if let Some(span) = span {
+                err = err.span(span);
+            }
+            err.emit()
+        }
     }
 }
 
@@ -283,7 +413,8 @@ fn path_from_bytes(bytes: &[u8]) -> Option<&Path> {
 /// Sources.
 #[derive(Default)]
 pub struct Sources<'ast> {
-    pub sources: IndexVec<SourceId, Source<'ast>>,
+    sources: IndexVec<SourceId, Source<'ast>>,
+    file_to_id: FxHashMap<Arc<SourceFile>, SourceId>,
 }
 
 impl fmt::Debug for Sources<'_> {
@@ -293,47 +424,55 @@ impl fmt::Debug for Sources<'_> {
     }
 }
 
-impl Sources<'_> {
+impl<'ast> Sources<'ast> {
     /// Creates a new empty list of parsed sources.
     pub fn new() -> Self {
-        Self { sources: IndexVec::new() }
+        Self::default()
     }
 
-    fn add_import(
+    /// Returns a reference to the source, if it exists.
+    #[inline]
+    pub fn get(&self, id: SourceId) -> Option<&Source<'ast>> {
+        self.sources.get(id)
+    }
+
+    /// Returns a mutable reference to the source, if it exists.
+    #[inline]
+    pub fn get_mut(&mut self, id: SourceId) -> Option<&mut Source<'ast>> {
+        self.sources.get_mut(id)
+    }
+
+    /// Returns the ID of the source file, if it exists.
+    pub fn get_file(&self, file: &Arc<SourceFile>) -> Option<(SourceId, &Source<'ast>)> {
+        self.file_to_id.get(file).map(|&id| (id, &self.sources[id]))
+    }
+
+    /// Returns the ID of the source file, if it exists.
+    pub fn get_file_mut(
         &mut self,
-        current: SourceId,
-        import_item_id: ast::ItemId,
-        import: Arc<SourceFile>,
-    ) {
-        let import_id = self.add_file(import);
-        self.sources[current].imports.push((import_item_id, import_id));
+        file: &Arc<SourceFile>,
+    ) -> Option<(SourceId, &mut Source<'ast>)> {
+        self.file_to_id.get(file).map(|&id| (id, &mut self.sources[id]))
     }
 
+    /// Returns the ID of the given file, or inserts it if it doesn't exist.
+    ///
+    /// Returns `true` if the file was newly inserted.
     #[instrument(level = "debug", skip_all)]
-    fn add_file(&mut self, file: Arc<SourceFile>) -> SourceId {
-        if let Some((id, _)) =
-            self.sources.iter_enumerated().find(|(_, source)| Arc::ptr_eq(&source.file, &file))
-        {
-            return id;
-        }
-        self.sources.push(Source::new(file))
+    pub fn get_or_insert_file(&mut self, file: Arc<SourceFile>) -> (SourceId, bool) {
+        let mut new = false;
+        let id = *self.file_to_id.entry(file).or_insert_with_key(|file| {
+            new = true;
+            self.sources.push(Source::new(file.clone()))
+        });
+        (id, new)
     }
 
-    /// Asserts that all sources are unique.
-    fn assert_unique(&self) {
-        if self.sources.len() <= 1 {
-            return;
-        }
-
-        debug_assert_eq!(
-            self.sources.iter().map(|s| s.file.stable_id).collect::<FxHashSet<_>>().len(),
-            self.sources.len(),
-            "parsing produced duplicate source files"
-        );
+    /// Removes the given file from the sources.
+    pub fn remove_file(&mut self, file: &Arc<SourceFile>) -> Option<Source<'ast>> {
+        self.file_to_id.remove(file).map(|id| self.sources.remove(id))
     }
-}
 
-impl<'ast> Sources<'ast> {
     /// Returns an iterator over all the ASTs.
     pub fn asts(&self) -> impl DoubleEndedIterator<Item = &ast::SourceUnit<'ast>> {
         self.sources.iter().filter_map(|source| source.ast.as_ref())
@@ -344,7 +483,48 @@ impl<'ast> Sources<'ast> {
         self.sources.as_raw_slice().par_iter().filter_map(|source| source.ast.as_ref())
     }
 
+    fn count_parsed(&self) -> usize {
+        self.sources.iter().filter(|s| s.ast.is_some()).count()
+    }
+
+    /// Returns the ID of the imported file, and whether it was newly added.
+    fn add_import(
+        &mut self,
+        current: SourceId,
+        import_item_id: ast::ItemId,
+        import: Arc<SourceFile>,
+        check_dup: bool,
+    ) -> (SourceId, bool) {
+        let ret = self.get_or_insert_file(import);
+        let (import_id, new) = ret;
+
+        let current = &mut self.sources[current].imports;
+        let value = (import_item_id, import_id);
+        if check_dup && current.contains(&value) {
+            assert!(!new, "duplicate import but source is new?");
+            return ret;
+        }
+        current.push(value);
+
+        ret
+    }
+
+    /// Asserts that all sources are unique.
+    fn assert_unique(&self) {
+        if self.sources.len() <= 1 {
+            return;
+        }
+
+        debug_assert_eq!(
+            self.sources.iter().map(|s| &*s.file).collect::<FxHashSet<_>>().len(),
+            self.sources.len(),
+            "parsing produced duplicate source files"
+        );
+    }
+
     /// Sorts the sources topologically in-place. Invalidates all source IDs.
+    ///
+    /// Reference: <https://github.com/argotorg/solidity/blob/965166317bbc2b02067eb87f222a2dce9d24e289/libsolidity/interface/CompilerStack.cpp#L1350>
     #[instrument(level = "debug", skip_all)]
     pub fn topo_sort(&mut self) {
         let len = self.len();
@@ -352,19 +532,23 @@ impl<'ast> Sources<'ast> {
             return;
         }
 
-        let mut order = Vec::with_capacity(len);
+        let mut order = IndexVec::with_capacity(len);
+        let mut map = index_vec![SourceId::MAX; len];
         let mut seen = FxHashSet::with_capacity_and_hasher(len, Default::default());
         debug_span!("topo_order").in_scope(|| {
             for id in self.sources.indices() {
-                self.topo_order(id, &mut order, &mut seen);
+                self.topo_order(id, &mut order, &mut map, &mut seen);
             }
         });
+        debug_assert!(
+            order.len() == len && !map.contains(&SourceId::MAX) && seen.len() == len,
+            "topo_order did not visit all sources"
+        );
 
         debug_span!("remap_imports").in_scope(|| {
             for source in &mut self.sources {
                 for (_, import) in &mut source.imports {
-                    *import =
-                        SourceId::from_usize(order.iter().position(|id| id == import).unwrap());
+                    *import = map[*import];
                 }
             }
         });
@@ -374,14 +558,20 @@ impl<'ast> Sources<'ast> {
         });
     }
 
-    fn topo_order(&self, id: SourceId, order: &mut Vec<SourceId>, seen: &mut FxHashSet<SourceId>) {
+    fn topo_order(
+        &self,
+        id: SourceId,
+        order: &mut IndexVec<SourceId, SourceId>,
+        map: &mut IndexVec<SourceId, SourceId>,
+        seen: &mut FxHashSet<SourceId>,
+    ) {
         if !seen.insert(id) {
             return;
         }
         for &(_, import_id) in &self.sources[id].imports {
-            self.topo_order(import_id, order, seen);
+            self.topo_order(import_id, order, map, seen);
         }
-        order.push(id);
+        map[id] = order.push(id);
     }
 }
 
@@ -405,7 +595,10 @@ impl std::ops::DerefMut for Sources<'_> {
 pub struct Source<'ast> {
     /// The source file.
     pub file: Arc<SourceFile>,
-    /// The AST IDs and source IDs of all the imports.
+    /// The individual imports with their resolved source IDs.
+    ///
+    /// Note that the source IDs may not be unique, as multiple imports may resolve to the same
+    /// source.
     pub imports: Vec<(ast::ItemId, SourceId)>,
     /// The AST.
     ///
@@ -441,15 +634,15 @@ impl Source<'_> {
 /// Sorts `data` according to `indices`.
 ///
 /// Adapted from: <https://stackoverflow.com/a/69774341>
-fn sort_by_indices<I: Idx, T>(data: &mut IndexVec<I, T>, mut indices: Vec<I>) {
+fn sort_by_indices<I: Idx, T>(data: &mut IndexVec<I, T>, mut indices: IndexVec<I, I>) {
     assert_eq!(data.len(), indices.len());
     for idx in data.indices() {
-        if indices[idx.index()] != idx {
+        if indices[idx] != idx {
             let mut current_idx = idx;
             loop {
-                let target_idx = indices[current_idx.index()];
-                indices[current_idx.index()] = current_idx;
-                if indices[target_idx.index()] == target_idx {
+                let target_idx = indices[current_idx];
+                indices[current_idx] = current_idx;
+                if indices[target_idx] == target_idx {
                     break;
                 }
                 data.swap(current_idx, target_idx);

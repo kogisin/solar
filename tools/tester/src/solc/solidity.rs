@@ -42,10 +42,6 @@ pub(crate) fn should_skip(path: &Path) -> Result<(), &'static str> {
         return Err("Unicode direction override checks not implemented");
     }
 
-    if path_contains("max_depth_reached_") {
-        return Err("recursion guard will not be implemented");
-    }
-
     if path_contains("wrong_compiler_") {
         return Err("Solidity pragma version is not checked");
     }
@@ -199,7 +195,7 @@ fn split_sources(src: &str, path: &Path, tmp_dir: &Path, mut arg: impl FnMut(OsS
     tmp_dir2.is_some()
 }
 
-// https://github.com/ethereum/solidity/blob/ac54fe1972f25227f9932c8b224ef119360b0e2d/test/TestCaseReader.cpp#L111
+// https://github.com/argotorg/solidity/blob/ac54fe1972f25227f9932c8b224ef119360b0e2d/test/TestCaseReader.cpp#L111
 fn source_delim(line: &str) -> Option<&str> {
     line.strip_prefix("==== Source:").and_then(|s| s.strip_suffix("====")).map(str::trim)
 }

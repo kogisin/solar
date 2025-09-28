@@ -3,29 +3,25 @@
     html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/solar/main/assets/logo.png",
     html_favicon_url = "https://raw.githubusercontent.com/paradigmxyz/solar/main/assets/favicon.ico"
 )]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 use clap::Parser as _;
-use solar_config::{ErrorFormat, ImportRemapping};
-use solar_interface::{
-    Result, Session, SourceMap,
-    diagnostics::{DiagCtxt, DynEmitter, HumanEmitter, JsonEmitter},
-};
+use solar_interface::{Result, Session};
 use solar_sema::CompilerRef;
-use std::{ops::ControlFlow, sync::Arc};
+use std::ops::ControlFlow;
 
 pub use solar_config::{self as config, Opts, UnstableOpts, version};
 
 pub mod utils;
 
 #[cfg(all(unix, any(target_env = "gnu", target_os = "macos")))]
-pub mod sigsegv_handler;
+pub mod signal_handler;
 
 /// Signal handler to extract a backtrace from stack overflow.
 ///
 /// This is a no-op because this platform doesn't support our signal handler's requirements.
 #[cfg(not(all(unix, any(target_env = "gnu", target_os = "macos"))))]
-pub mod sigsegv_handler {
+pub mod signal_handler {
     #[cfg(unix)]
     use libc as _;
 
@@ -59,13 +55,13 @@ fn run_default(compiler: &mut CompilerRef<'_>) -> Result {
     }
 
     let mut pcx = compiler.parse();
-    pcx.file_resolver.add_include_paths(sess.opts.include_path.iter().cloned());
 
     // Partition arguments into three categories:
     // - `stdin`: `-`, occurrences after the first are ignored
-    // - remappings: `[context:]prefix=path`
+    // - remappings: `[context:]prefix=path`, already parsed as part of `Opts`
     // - paths: everything else
     let mut seen_stdin = false;
+    let mut paths = Vec::new();
     for arg in sess.opts.input.iter().map(String::as_str) {
         if arg == "-" {
             if !seen_stdin {
@@ -76,15 +72,13 @@ fn run_default(compiler: &mut CompilerRef<'_>) -> Result {
         }
 
         if arg.contains('=') {
-            let remapping = arg
-                .parse::<ImportRemapping>()
-                .map_err(|e| sess.dcx.err(format!("invalid remapping {arg:?}: {e}")).emit())?;
-            pcx.file_resolver.add_import_remapping(remapping);
             continue;
         }
 
-        pcx.load_file(arg.as_ref())?;
+        paths.push(arg);
     }
+
+    pcx.par_load_files(paths)?;
 
     pcx.parse();
     let ControlFlow::Continue(()) = compiler.lower_asts()? else { return Ok(()) };
@@ -95,39 +89,7 @@ fn run_default(compiler: &mut CompilerRef<'_>) -> Result {
 }
 
 fn run_compiler_with(opts: Opts, f: impl FnOnce(&mut CompilerRef<'_>) -> Result + Send) -> Result {
-    let ui_testing = opts.unstable.ui_testing;
-    let source_map = Arc::new(SourceMap::empty());
-    let emitter: Box<DynEmitter> = match opts.error_format {
-        ErrorFormat::Human => {
-            let color = match opts.color {
-                clap::ColorChoice::Always => solar_interface::ColorChoice::Always,
-                clap::ColorChoice::Auto => solar_interface::ColorChoice::Auto,
-                clap::ColorChoice::Never => solar_interface::ColorChoice::Never,
-            };
-            let human = HumanEmitter::stderr(color)
-                .source_map(Some(source_map.clone()))
-                .ui_testing(ui_testing);
-            Box::new(human)
-        }
-        ErrorFormat::Json | ErrorFormat::RustcJson => {
-            // `io::Stderr` is not buffered.
-            let writer = Box::new(std::io::BufWriter::new(std::io::stderr()));
-            let json = JsonEmitter::new(writer, source_map.clone())
-                .pretty(opts.pretty_json_err)
-                .rustc_like(matches!(opts.error_format, ErrorFormat::RustcJson))
-                .ui_testing(ui_testing);
-            Box::new(json)
-        }
-        format => todo!("{format:?}"),
-    };
-    let dcx = DiagCtxt::new(emitter).set_flags(|flags| {
-        flags.deduplicate_diagnostics &= !ui_testing;
-        flags.track_diagnostics &= !ui_testing;
-        flags.track_diagnostics |= opts.unstable.track_diagnostics;
-        flags.can_emit_warnings |= !opts.no_warnings;
-    });
-
-    let mut sess = Session::builder().dcx(dcx).source_map(source_map).opts(opts).build();
+    let mut sess = Session::new(opts);
     sess.infer_language();
     sess.validate()?;
 

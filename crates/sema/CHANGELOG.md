@@ -5,6 +5,69 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7](https://github.com/paradigmxyz/solar/releases/tag/v0.1.7)
+
+### Bug Fixes
+
+- [sema] Handle linearization failure fallout ([#472](https://github.com/paradigmxyz/solar/issues/472))
+
+### Features
+
+- [sema] Add Compiler::stage getter ([#490](https://github.com/paradigmxyz/solar/issues/490))
+- Diagnostic suggestions ([#474](https://github.com/paradigmxyz/solar/issues/474))
+- Bump to annotate-snippets 0.12, diagnostic tweaks ([#465](https://github.com/paradigmxyz/solar/issues/465))
+- [sema] Add `Compiler::enter{,_mut}_sequential` ([#457](https://github.com/paradigmxyz/solar/issues/457))
+
+### Miscellaneous Tasks
+
+- Improve 'parsed' debug log ([#489](https://github.com/paradigmxyz/solar/issues/489))
+- Use json_type to sort ABIs ([#456](https://github.com/paradigmxyz/solar/issues/456))
+- Move VERSION to config::version::SEMVER_VERSION and log it ([#454](https://github.com/paradigmxyz/solar/issues/454))
+- Hide more source map implementation details ([#450](https://github.com/paradigmxyz/solar/issues/450))
+- Chore!(data-structures): remove aliases in sync re-exports ([#452](https://github.com/paradigmxyz/solar/issues/452))
+- [meta] Update solidity links ([#448](https://github.com/paradigmxyz/solar/issues/448))
+- Make all features reachable from meta crate ([#444](https://github.com/paradigmxyz/solar/issues/444))
+
+### Performance
+
+- [interface] Cache thread pool inside of session ([#458](https://github.com/paradigmxyz/solar/issues/458))
+
+## [0.1.6](https://github.com/paradigmxyz/solar/releases/tag/v0.1.6)
+
+### Bug Fixes
+
+- Error on dummy instead of empty args ([#407](https://github.com/paradigmxyz/solar/issues/407))
+- OnDrop drops, rename to DropGuard ([#399](https://github.com/paradigmxyz/solar/issues/399))
+
+### Features
+
+- Add getters for source by file name (path) ([#442](https://github.com/paradigmxyz/solar/issues/442))
+- [interface] Add FileLoader abstraction for fs/io ([#438](https://github.com/paradigmxyz/solar/issues/438))
+- Implement base_path, streamline creating pcx ([#436](https://github.com/paradigmxyz/solar/issues/436))
+- Allow session mutable access ([#435](https://github.com/paradigmxyz/solar/issues/435))
+- Make `Lit`erals implement `Copy` ([#414](https://github.com/paradigmxyz/solar/issues/414))
+- Add Compiler ([#397](https://github.com/paradigmxyz/solar/issues/397))
+- [sema] Add helper methods to Function ([#385](https://github.com/paradigmxyz/solar/issues/385))
+
+### Miscellaneous Tasks
+
+- Downgrade some debug spans to trace ([#412](https://github.com/paradigmxyz/solar/issues/412))
+- Abstract implementation of Declarations ([#410](https://github.com/paradigmxyz/solar/issues/410))
+- Remove query tracing ([#406](https://github.com/paradigmxyz/solar/issues/406))
+- Clean up contract inheritance linearization ([#405](https://github.com/paradigmxyz/solar/issues/405))
+
+### Other
+
+- Enforce typos ([#423](https://github.com/paradigmxyz/solar/issues/423))
+
+### Performance
+
+- Load input source files in parallel ([#429](https://github.com/paradigmxyz/solar/issues/429))
+- [sema] Better parallel parser scheduling ([#428](https://github.com/paradigmxyz/solar/issues/428))
+- Pool symbol resolver scopes, refactor ([#413](https://github.com/paradigmxyz/solar/issues/413))
+- [sema] Add some reserve calls ([#411](https://github.com/paradigmxyz/solar/issues/411))
+- [sema] Use `Cell<usize>` in lowering ([#408](https://github.com/paradigmxyz/solar/issues/408))
+
 ## [0.1.5](https://github.com/paradigmxyz/solar/releases/tag/v0.1.5)
 
 ### Bug Fixes
